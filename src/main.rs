@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const N: usize = 15;
 const CELLS: usize = N * N;
@@ -154,7 +154,7 @@ struct Node {
     children: Mutex<Vec<(Move, NodeId)>>,
 }
 
-type Arena = Arc<Mutex<Vec<Arc<Node>>>>;
+type Arena = Arc<RwLock<Vec<Arc<Node>>>>;
 type Tt = Arc<TtSharded>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -277,10 +277,7 @@ impl TtSharded {
     }
 
     fn insert(&self, hash: u64, idx: NodeId) {
-        self.shards[Self::shard_idx(hash)]
-            .lock()
-            .unwrap()
-            .insert(hash, idx);
+        self.shards[Self::shard_idx(hash)].lock().unwrap().insert(hash, idx);
     }
 }
 
@@ -378,10 +375,12 @@ fn move_to_xy(mv: usize) -> (usize, usize) {
 }
 
 fn opening_move(board: &Board) -> Option<usize> {
-    if board.moves_played == 0 {
-        Some(idx(N / 2, N / 2))
-    } else {
-        None
+    match board.moves_played {
+        // Black always opens at center.
+        0 => Some(idx(N / 2, N / 2)),
+        // If Black opened at center, White responds with a strong diagonal offset.
+        1 if board.cells[idx(N / 2, N / 2)] == BLACK => Some(idx(N / 2 + 1, N / 2 + 1)),
+        _ => None,
     }
 }
 
@@ -390,11 +389,11 @@ fn idx(x: usize, y: usize) -> usize {
 }
 
 fn node_at(arena: &Arena, idx: NodeId) -> Arc<Node> {
-    arena.lock().unwrap()[idx].clone()
+    arena.read().unwrap()[idx].clone()
 }
 
 fn add_child(arena: &Arena, node: Node) -> NodeId {
-    let mut a = arena.lock().unwrap();
+    let mut a = arena.write().unwrap();
     a.push(Arc::new(node));
     a.len() - 1
 }
@@ -405,11 +404,50 @@ fn tt_with_root(hash: u64, idx: NodeId) -> Tt {
     tt
 }
 
+/// Returns true if placing `player` at `pos` on `cells` would create 5-in-a-row.
+/// `cells[pos]` must be empty; no board clone needed.
+fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
+    let x = (pos % N) as isize;
+    let y = (pos / N) as isize;
+    for &(dx, dy) in &DIRS {
+        let mut count = 1;
+        for &sign in &[1isize, -1isize] {
+            let mut i = 1isize;
+            loop {
+                let nx = x + sign * dx * i;
+                let ny = y + sign * dy * i;
+                if nx < 0 || nx >= N as isize || ny < 0 || ny >= N as isize {
+                    break;
+                }
+                if cells[idx(nx as usize, ny as usize)] != player {
+                    break;
+                }
+                count += 1;
+                i += 1;
+            }
+        }
+        if count >= 5 {
+            return true;
+        }
+    }
+    false
+}
+
 fn rollout(mut board: Board, rng: &mut Rng, local_radius: usize) -> u8 {
     let mut outcome = board.terminal();
     while outcome.is_none() {
         let legal = board.local_moves(local_radius);
-        let mv = legal[rng.gen_usize(legal.len())] as usize;
+        let opp = if board.side == BLACK { WHITE } else { BLACK };
+        // 1. Win immediately if possible.
+        // 2. Block opponent's immediate win.
+        // 3. Fall back to random local move.
+        let mv = legal
+            .iter()
+            .find(|&&m| wins_at(&board.cells, board.side, m as usize))
+            .or_else(|| legal.iter().find(|&&m| wins_at(&board.cells, opp, m as usize)))
+            .copied()
+            .map(|m| m as usize)
+            .unwrap_or_else(|| legal[rng.gen_usize(legal.len())] as usize);
         board.play(mv);
         outcome = board.terminal();
     }
@@ -420,7 +458,7 @@ fn analyze_root(arena: &Arena) -> RootAnalysis {
     let root_node = node_at(arena, 0);
     let kids = root_node.children.lock().unwrap().clone();
     let root_untried = root_node.untried.lock().unwrap().len();
-    let node_count = arena.lock().unwrap().len();
+    let node_count = arena.read().unwrap().len();
     let total_visits = root_node.visits.load(Ordering::Relaxed);
 
     let mut ranked = Vec::<Candidate>::with_capacity(kids.len());
@@ -456,7 +494,7 @@ fn analyze_root(arena: &Arena) -> RootAnalysis {
     }
 }
 
-fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
+fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8, radius: usize) -> i8 {
     if let Some(t) = board.terminal() {
         return if t == 0 { 0 } else { -1 };
     }
@@ -465,10 +503,10 @@ fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
     }
 
     let mut best = -1i8;
-    for mv in board.legal_moves() {
+    for mv in board.local_moves(radius) {
         let mut b2 = board.clone();
         b2.play(mv as usize);
-        let score = -alpha_beta(&b2, depth - 1, -beta, -alpha);
+        let score = -alpha_beta(&b2, depth - 1, -beta, -alpha, radius);
         if score > best {
             best = score;
         }
@@ -483,7 +521,12 @@ fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
 }
 
 /// Picks forced win first, otherwise first non-losing move from ranked candidates.
-fn tactical_pick(board: &Board, candidates: &[Candidate], depth: usize) -> Option<usize> {
+fn tactical_pick(
+    board: &Board,
+    candidates: &[Candidate],
+    depth: usize,
+    radius: usize,
+) -> Option<usize> {
     if depth == 0 || candidates.is_empty() {
         return None;
     }
@@ -493,7 +536,7 @@ fn tactical_pick(board: &Board, candidates: &[Candidate], depth: usize) -> Optio
         let mv = c.mv;
         let mut b2 = board.clone();
         b2.play(mv);
-        let score_for_root = -alpha_beta(&b2, depth.saturating_sub(1), -1, 1);
+        let score_for_root = -alpha_beta(&b2, depth.saturating_sub(1), -1, 1, radius);
         if score_for_root == 1 {
             return Some(mv);
         }
@@ -590,8 +633,9 @@ fn merged_root_candidates(board: &Board, ranked: &[Candidate]) -> Vec<Candidate>
         by_move.insert(c.mv, *c);
     }
 
-    let mut out = Vec::<Candidate>::with_capacity(board.legal_moves().len());
-    for mv in board.legal_moves() {
+    let legal = board.legal_moves();
+    let mut out = Vec::<Candidate>::with_capacity(legal.len());
+    for mv in legal {
         let m = mv as usize;
         out.push(by_move.get(&m).copied().unwrap_or(Candidate {
             mv: m,
@@ -613,10 +657,10 @@ fn maybe_print_debug(
 ) {
     if cfg.debug {
         eprintln!(
-            "debug: root_expanded={}, root_unexpanded={}, ranked={}, tactical_depth={}, tactical_topk={}, tactical_chosen={}, mcts_chosen={}, total_root_visits={}",
+            "debug: root_expanded={}, root_unexpanded={}, root_total={}, tactical_depth={}, tactical_topk={}, tactical_chosen={}, mcts_chosen={}, total_root_visits={}",
             root_expanded,
             root_unexpanded,
-            root_expanded,
+            root_expanded + root_unexpanded,
             cfg.tactical_depth,
             cfg.tactical_topk,
             tactical_chosen,
@@ -636,8 +680,12 @@ fn worker(
     tt: Tt,
     cfg: EngineConfig,
 ) {
-    let seed = cfg.seed_base.unwrap_or_else(|| Instant::now().elapsed().as_nanos() as u64)
-        ^ ((id as u64) << 32)
+    let seed = cfg.seed_base.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }) ^ ((id as u64) << 32)
         ^ 0x9E3779B97F4A7C15;
     let mut rng = Rng::new(seed);
     let mut iters = 0u64;
@@ -687,7 +735,12 @@ fn worker(
                     };
                     add_child(&arena, child)
                 });
-                node.children.lock().unwrap().push((mv as Move, child_idx));
+                {
+                    let mut kids = node.children.lock().unwrap();
+                    if !kids.iter().any(|&(_, id)| id == child_idx) {
+                        kids.push((mv as Move, child_idx));
+                    }
+                }
                 path.push(child_idx);
 
                 if let Some(t) = child_terminal {
@@ -728,16 +781,32 @@ fn worker(
             path.push(best.1);
         };
 
-        let reward = if outcome == root_player {
-            BACKPROP_WIN
-        } else if outcome == 0 {
-            BACKPROP_DRAW
-        } else {
-            BACKPROP_LOSS
-        };
-
-        for idx in path {
-            let n = node_at(&arena, idx);
+        for (depth, idx) in path.iter().enumerate() {
+            let n = node_at(&arena, *idx);
+            // Each node stores win-halves from the perspective of the player
+            // who *chose* this node (the parent).  Depth 0 = root (root_player
+            // aggregate); depth 1 = chosen by root_player; depth 2 = chosen by
+            // opponent; etc.  Flip at every other level so UCT selection
+            // correctly maximises each side's own win-rate.
+            let reward = if depth > 0 && depth % 2 == 0 {
+                // Opponent chose this node — store from opponent's perspective.
+                if outcome != root_player && outcome != 0 {
+                    BACKPROP_WIN
+                } else if outcome == 0 {
+                    BACKPROP_DRAW
+                } else {
+                    BACKPROP_LOSS
+                }
+            } else {
+                // Root player's perspective (root itself, or node chosen by root_player).
+                if outcome == root_player {
+                    BACKPROP_WIN
+                } else if outcome == 0 {
+                    BACKPROP_DRAW
+                } else {
+                    BACKPROP_LOSS
+                }
+            };
             n.visits.fetch_add(1, Ordering::Relaxed);
             n.win_halves.fetch_add(reward, Ordering::Relaxed);
         }
@@ -749,8 +818,27 @@ fn worker(
     }
 }
 
+/// Runs analysis + tactical selection on the current search state.
+/// Returns (chosen move, tactical_override flag, full analysis).
+fn analyse_and_pick(board: &Board, arena: &Arena, cfg: EngineConfig) -> (Option<usize>, bool, RootAnalysis) {
+    let analysis = analyze_root(arena);
+    let candidates = merged_root_candidates(board, &analysis.ranked);
+    let tactical = if cfg.tactical_depth > 0 && cfg.tactical_topk > 0 {
+        let k = cfg.tactical_topk.min(candidates.len());
+        tactical_pick(board, &candidates[..k], cfg.tactical_depth, cfg.local_radius)
+    } else {
+        None
+    };
+    let mv = tactical.or(analysis.snapshot.best_mv_mcts);
+    (mv, tactical.is_some(), analysis)
+}
+
 fn run(args: &[String]) -> i32 {
-    let cfg = EngineConfig::from_env();
+    let mut cfg = EngineConfig::from_env();
+    // Guard: seconds=0 with no iteration cap has no termination condition → fall back to default.
+    if cfg.seconds == 0 && cfg.max_iters.is_none() {
+        cfg.seconds = EngineConfig::default().seconds;
+    }
     let mut board = Board::new();
 
     if let Err(msg) = apply_moves(&mut board, args) {
@@ -772,7 +860,7 @@ fn run(args: &[String]) -> i32 {
     }
 
     let root = make_root_node(&board, cfg);
-    let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+    let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
     let tt: Tt = tt_with_root(board.tt_key(), 0usize);
     let root_player = board.side;
     let threads = thread::available_parallelism()
@@ -785,33 +873,20 @@ fn run(args: &[String]) -> i32 {
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        let analysis = analyze_root(&arena);
+        let (chosen_mv, tactical_override, analysis) = analyse_and_pick(&board, &arena, cfg);
         let snap = analysis.snapshot;
-        let ranked = analysis.ranked;
-        let tactical_candidates = merged_root_candidates(&board, &ranked);
-
-        let tactical_best = if cfg.tactical_depth > 0 && cfg.tactical_topk > 0 {
-            let k = cfg.tactical_topk.min(tactical_candidates.len());
-            tactical_pick(&board, &tactical_candidates[..k], cfg.tactical_depth)
-        } else {
-            None
-        };
-
-        let chosen_mv = tactical_best.or(snap.best_mv_mcts);
         maybe_print_debug(
             cfg,
-            ranked.len(),
+            analysis.ranked.len(),
             analysis.root_untried,
-            tactical_best.is_some(),
+            tactical_override,
             snap.best_mv_mcts.is_some(),
             snap.total_visits,
         );
-
         if cfg.debug {
-            let dbg_fallback_mv = board.local_moves(cfg.local_radius)[0] as usize;
-            let dbg_mv = chosen_mv.unwrap_or(dbg_fallback_mv);
+            let dbg_mv = chosen_mv.unwrap_or_else(|| board.local_moves(cfg.local_radius)[0] as usize);
             print_search_choice(
-                candidate_for_mv(&ranked, dbg_mv),
+                candidate_for_mv(&analysis.ranked, dbg_mv),
                 start.elapsed().as_secs(),
                 threads,
                 snap.node_count,
@@ -843,21 +918,11 @@ fn run(args: &[String]) -> i32 {
         let _ = h.join();
     }
 
-    let analysis = analyze_root(&arena);
-    let ranked = analysis.ranked;
-    let tactical_candidates = merged_root_candidates(&board, &ranked);
-    let chosen_mv = if cfg.tactical_depth > 0 && cfg.tactical_topk > 0 {
-        let k = cfg.tactical_topk.min(tactical_candidates.len());
-        tactical_pick(&board, &tactical_candidates[..k], cfg.tactical_depth)
-            .or(analysis.snapshot.best_mv_mcts)
-    } else {
-        analysis.snapshot.best_mv_mcts
-    };
-    let fallback_mv = board.local_moves(cfg.local_radius)[0] as usize;
-    let mv = chosen_mv.unwrap_or(fallback_mv);
+    let (chosen_mv, _, analysis) = analyse_and_pick(&board, &arena, cfg);
+    let mv = chosen_mv.unwrap_or_else(|| board.local_moves(cfg.local_radius)[0] as usize);
     if cfg.debug {
         print_search_choice(
-            candidate_for_mv(&ranked, mv),
+            candidate_for_mv(&analysis.ranked, mv),
             start.elapsed().as_secs(),
             threads,
             analysis.snapshot.node_count,
@@ -867,6 +932,7 @@ fn run(args: &[String]) -> i32 {
     0
 }
 
+// tarpaulin coverage(off)
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = run(&args);
@@ -874,6 +940,7 @@ fn main() {
         std::process::exit(code);
     }
 }
+// tarpaulin coverage(on)
 
 #[cfg(test)]
 mod tests {
@@ -914,12 +981,25 @@ mod tests {
 
     #[test]
     fn opening_move_empty_and_non_empty() {
+        // Move 0: Black always goes to center.
         let b = Board::new();
         assert_eq!(opening_move(&b), Some(idx(7, 7)));
 
+        // Move 1: Black at center → White gets strong diagonal response.
+        let mut b_center = Board::new();
+        b_center.play(idx(7, 7));
+        assert_eq!(opening_move(&b_center), Some(idx(8, 8)));
+
+        // Move 1: Black NOT at center → no opening book response.
         let mut b2 = Board::new();
         b2.play(idx(0, 0));
         assert_eq!(opening_move(&b2), None);
+
+        // Move 2+: no opening book.
+        let mut b3 = Board::new();
+        b3.play(idx(7, 7));
+        b3.play(idx(8, 8));
+        assert_eq!(opening_move(&b3), None);
     }
 
     #[test]
@@ -1083,7 +1163,7 @@ mod tests {
         b.side = BLACK;
         b.moves_played = 4;
         b.last = Some(idx(3, 0));
-        assert_eq!(alpha_beta(&b, 1, -1, 1), 1);
+        assert_eq!(alpha_beta(&b, 1, -1, 1, 2), 1);
     }
 
     #[test]
@@ -1110,7 +1190,7 @@ mod tests {
                 winrate: 0.4,
             },
         ];
-        assert_eq!(tactical_pick(&b, &candidates, 1), Some(winning));
+        assert_eq!(tactical_pick(&b, &candidates, 1, 2), Some(winning));
     }
 
     #[test]
@@ -1137,7 +1217,7 @@ mod tests {
                 winrate: 0.4,
             },
         ];
-        assert_eq!(tactical_pick(&b, &candidates, 2), Some(block));
+        assert_eq!(tactical_pick(&b, &candidates, 2, 2), Some(block));
     }
 
     #[test]
@@ -1148,8 +1228,8 @@ mod tests {
             visits: 1,
             winrate: 0.5,
         }];
-        assert_eq!(tactical_pick(&b, &[], 2), None);
-        assert_eq!(tactical_pick(&b, &candidates, 0), None);
+        assert_eq!(tactical_pick(&b, &[], 2, 2), None);
+        assert_eq!(tactical_pick(&b, &candidates, 0, 2), None);
     }
 
     #[test]
@@ -1182,15 +1262,15 @@ mod tests {
         term.side = WHITE;
         term.moves_played = 5;
         term.last = Some(idx(4, 0));
-        assert_eq!(alpha_beta(&term, 3, -1, 1), -1);
+        assert_eq!(alpha_beta(&term, 3, -1, 1, 2), -1);
 
         let b = Board::new();
-        assert_eq!(alpha_beta(&b, 0, -1, 1), 0);
+        assert_eq!(alpha_beta(&b, 0, -1, 1, 2), 0);
 
         let mut draw = Board::new();
         draw.moves_played = CELLS;
         draw.last = None;
-        assert_eq!(alpha_beta(&draw, 3, -1, 1), 0);
+        assert_eq!(alpha_beta(&draw, 3, -1, 1, 2), 0);
     }
 
     #[test]
@@ -1218,7 +1298,7 @@ mod tests {
             untried: Mutex::new(vec![0]),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let child_idx = add_child(
             &arena,
             Node {
@@ -1270,7 +1350,7 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![
+        let arena: Arena = Arc::new(RwLock::new(vec![
             Arc::new(root),
             Arc::new(child_a),
             Arc::new(child_b),
@@ -1298,7 +1378,7 @@ mod tests {
             untried: Mutex::new(board.legal_moves()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(true));
         worker(
@@ -1325,7 +1405,7 @@ mod tests {
             untried: Mutex::new(board.legal_moves()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1352,7 +1432,7 @@ mod tests {
             untried: Mutex::new(board.legal_moves()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1366,7 +1446,7 @@ mod tests {
         );
         let root_node = node_at(&arena, 0);
         assert!(root_node.visits.load(Ordering::Relaxed) >= 2);
-        assert!(arena.lock().unwrap().len() > 1);
+        assert!(arena.read().unwrap().len() > 1);
     }
 
     #[test]
@@ -1380,7 +1460,7 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1414,7 +1494,7 @@ mod tests {
             untried: Mutex::new(vec![idx(4, 0) as Move]),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1426,7 +1506,7 @@ mod tests {
             tt,
             test_cfg(Some(1), 2),
         );
-        assert!(arena.lock().unwrap().len() >= 2);
+        assert!(arena.read().unwrap().len() >= 2);
     }
 
     #[test]
@@ -1448,7 +1528,7 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root), Arc::new(child)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root), Arc::new(child)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let mut b2 = board.clone();
         b2.play(idx(0, 0));
@@ -1482,7 +1562,7 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1521,7 +1601,7 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
 
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root), Arc::new(child)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root), Arc::new(child)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         tt.insert(child_board.tt_key(), 1usize);
 
@@ -1540,7 +1620,7 @@ mod tests {
         let kids = root_node.children.lock().unwrap().clone();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0], (idx(0, 0) as Move, 1usize));
-        assert_eq!(arena.lock().unwrap().len(), 2);
+        assert_eq!(arena.read().unwrap().len(), 2);
     }
 
     #[test]
@@ -1577,7 +1657,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         env::set_var(ENV_SECONDS, "0");
         env::set_var(ENV_ITERS, "0");
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_ITERS);
@@ -1588,7 +1668,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         env::set_var(ENV_SECONDS, "1");
         env::remove_var(ENV_ITERS);
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
     }
@@ -1598,7 +1678,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         env::set_var(ENV_SECONDS, "1");
         env::set_var(ENV_ITERS, "1000000");
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_ITERS);
@@ -1609,7 +1689,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         env::set_var(ENV_SECONDS, "2");
         env::set_var(ENV_ITERS, "1000000000");
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_ITERS);
@@ -1622,7 +1702,7 @@ mod tests {
         env::set_var(ENV_EARLY_STOP_RATIO, "0.0");
         env::set_var(ENV_EARLY_STOP_MIN_VISITS, "0");
         env::remove_var(ENV_ITERS);
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_EARLY_STOP_RATIO);
@@ -1636,11 +1716,31 @@ mod tests {
         env::set_var(ENV_TACTICAL_DEPTH, "0");
         env::set_var(ENV_TACTICAL_TOPK, "0");
         env::remove_var(ENV_ITERS);
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_TACTICAL_DEPTH);
         env::remove_var(ENV_TACTICAL_TOPK);
+    }
+
+    #[test]
+    fn run_fallback_move_when_no_mcts_and_no_tactical() {
+        // With 0 iterations and tactical disabled, analyse_and_pick returns None
+        // for both the in-loop and post-loop calls, exercising the unwrap_or_else
+        // fallback on both lines. debug=1 also covers the in-loop debug branch.
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var(ENV_SECONDS, "0");
+        env::set_var(ENV_ITERS, "0");
+        env::set_var(ENV_TACTICAL_DEPTH, "0");
+        env::set_var(ENV_TACTICAL_TOPK, "0");
+        env::set_var(ENV_DEBUG, "1");
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
+        assert_eq!(run(&args), 0);
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
+        env::remove_var(ENV_TACTICAL_DEPTH);
+        env::remove_var(ENV_TACTICAL_TOPK);
+        env::remove_var(ENV_DEBUG);
     }
 
     #[test]
@@ -1649,7 +1749,7 @@ mod tests {
         env::set_var(ENV_SECONDS, "1");
         env::set_var(ENV_DEBUG, "1");
         env::remove_var(ENV_ITERS);
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_DEBUG);
@@ -1661,7 +1761,7 @@ mod tests {
         env::set_var(ENV_SECONDS, "1");
         env::set_var(ENV_LOCAL_RADIUS, "nope");
         env::remove_var(ENV_ITERS);
-        let args = vec!["7,7".to_string()];
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
         env::remove_var(ENV_LOCAL_RADIUS);
@@ -1694,5 +1794,282 @@ mod tests {
         env::remove_var(ENV_ITERS);
         env::remove_var(ENV_DEBUG);
         assert_eq!(run(&[]), 0);
+    }
+
+    #[test]
+    fn run_seconds_zero_without_iters_uses_default_not_hang() {
+        // MCTS_SECONDS=0 without MCTS_ITERS has no termination condition.
+        // The guard in run() must fall back to the default time limit.
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var(ENV_SECONDS, "0");
+        env::remove_var(ENV_ITERS);
+        let args = vec!["7,7".to_string(), "7,8".to_string()];
+        assert_eq!(run(&args), 0);
+        env::remove_var(ENV_SECONDS);
+    }
+
+    // ── Correctness invariants that code-coverage alone cannot catch ──────────
+
+    /// When root_player wins and the search path is 3 nodes deep:
+    ///   depth 0 (root)   → root_player's perspective → BACKPROP_WIN
+    ///   depth 1 (child1) → chosen by root_player     → BACKPROP_WIN
+    ///   depth 2 (child2) → chosen by opponent        → BACKPROP_LOSS
+    /// The old non-alternating code gave BACKPROP_WIN to *every* node, which
+    /// made the opponent cooperate with the root player during UCT selection.
+    #[test]
+    fn backprop_alternates_reward_root_player_wins() {
+        let board = Board::new();
+        let mv1 = idx(7, 7) as Move;
+        let mv2 = idx(7, 8) as Move;
+        let root = Node {
+            visits: AtomicU64::new(1),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv1, 1)]),
+        };
+        let child1 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv2, 2)]),
+        };
+        let child2 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: Some(BLACK),
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
+        };
+        let arena: Arena = Arc::new(RwLock::new(vec![
+            Arc::new(root),
+            Arc::new(child1),
+            Arc::new(child2),
+        ]));
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
+        let stop = Arc::new(AtomicBool::new(false));
+        worker(
+            20,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
+        assert_eq!(
+            node_at(&arena, 0).win_halves.load(Ordering::Relaxed),
+            BACKPROP_WIN,
+            "depth 0: root player's win should be BACKPROP_WIN"
+        );
+        assert_eq!(
+            node_at(&arena, 1).win_halves.load(Ordering::Relaxed),
+            BACKPROP_WIN,
+            "depth 1: chosen by root_player, should be BACKPROP_WIN"
+        );
+        assert_eq!(
+            node_at(&arena, 2).win_halves.load(Ordering::Relaxed),
+            BACKPROP_LOSS,
+            "depth 2: chosen by opponent, should be BACKPROP_LOSS (opponent lost)"
+        );
+    }
+
+    /// Mirror of the above: when the *opponent* wins the rewards must flip.
+    ///   depth 0 (root)   → BACKPROP_LOSS
+    ///   depth 1 (child1) → BACKPROP_LOSS
+    ///   depth 2 (child2) → BACKPROP_WIN  (opponent's perspective: they won)
+    #[test]
+    fn backprop_alternates_reward_opponent_wins() {
+        let board = Board::new();
+        let mv1 = idx(7, 7) as Move;
+        let mv2 = idx(7, 8) as Move;
+        let root = Node {
+            visits: AtomicU64::new(1),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv1, 1)]),
+        };
+        let child1 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv2, 2)]),
+        };
+        let child2 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: Some(WHITE),
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
+        };
+        let arena: Arena = Arc::new(RwLock::new(vec![
+            Arc::new(root),
+            Arc::new(child1),
+            Arc::new(child2),
+        ]));
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
+        let stop = Arc::new(AtomicBool::new(false));
+        worker(
+            21,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
+        assert_eq!(
+            node_at(&arena, 0).win_halves.load(Ordering::Relaxed),
+            BACKPROP_LOSS,
+            "depth 0: opponent won, root sees BACKPROP_LOSS"
+        );
+        assert_eq!(
+            node_at(&arena, 1).win_halves.load(Ordering::Relaxed),
+            BACKPROP_LOSS,
+            "depth 1: chosen by root_player, opponent won → BACKPROP_LOSS"
+        );
+        assert_eq!(
+            node_at(&arena, 2).win_halves.load(Ordering::Relaxed),
+            BACKPROP_WIN,
+            "depth 2: chosen by opponent, opponent won → BACKPROP_WIN"
+        );
+    }
+
+    /// Draw outcome at an even-depth (opponent's) node must record BACKPROP_DRAW
+    /// from the opponent's perspective — the branch `outcome == 0` at depth > 0 && depth % 2 == 0.
+    #[test]
+    fn backprop_draw_at_opponent_depth() {
+        let board = Board::new();
+        let mv1 = idx(7, 7) as Move;
+        let mv2 = idx(7, 8) as Move;
+        let root = Node {
+            visits: AtomicU64::new(1),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv1, 1)]),
+        };
+        let child1 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(vec![(mv2, 2)]),
+        };
+        // Draw terminal at depth 2 (chosen by opponent).
+        let child2 = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: Some(0),
+            untried: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
+        };
+        let arena: Arena = Arc::new(RwLock::new(vec![
+            Arc::new(root),
+            Arc::new(child1),
+            Arc::new(child2),
+        ]));
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
+        let stop = Arc::new(AtomicBool::new(false));
+        worker(
+            30,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
+        assert_eq!(
+            node_at(&arena, 2).win_halves.load(Ordering::Relaxed),
+            BACKPROP_DRAW,
+            "depth 2: chosen by opponent, draw → BACKPROP_DRAW from opponent's perspective"
+        );
+    }
+
+    /// Two different untried moves that the TT maps to the same child node
+    /// must not produce duplicate entries in the parent's children list.
+    /// The old code pushed unconditionally; the guard prevents the second push.
+    #[test]
+    fn worker_no_duplicate_children_when_tt_returns_same_node() {
+        let board = Board::new();
+        let mv1 = idx(3, 3) as Move;
+        let mv2 = idx(4, 4) as Move;
+        let root = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(vec![mv1, mv2]),
+            children: Mutex::new(Vec::new()),
+        };
+        // The single shared child that both moves will resolve to via the TT.
+        let shared_child = Node {
+            visits: AtomicU64::new(0),
+            win_halves: AtomicU64::new(0),
+            virtual_loss: AtomicU64::new(0),
+            terminal: None,
+            untried: Mutex::new(board.local_moves(2)),
+            children: Mutex::new(Vec::new()),
+        };
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root), Arc::new(shared_child)]));
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
+        // Force both move-boards to resolve to node 1 in the TT.
+        let mut b1 = board.clone();
+        b1.play(mv1 as usize);
+        let mut b2 = board.clone();
+        b2.play(mv2 as usize);
+        tt.insert(b1.tt_key(), 1usize);
+        tt.insert(b2.tt_key(), 1usize);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        worker(
+            22,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(2), 2),
+        );
+
+        let kids = node_at(&arena, 0).children.lock().unwrap().clone();
+        let unique_ids: std::collections::HashSet<_> = kids.iter().map(|&(_, id)| id).collect();
+        assert_eq!(
+            kids.len(),
+            unique_ids.len(),
+            "children list must not contain duplicate node IDs"
+        );
+    }
+
+    #[test]
+    fn wins_at_detects_five_in_a_row_and_blocks() {
+        let mut cells = [0u8; CELLS];
+        // Place BLACK at (0,0),(1,0),(2,0),(3,0) — four in a row.
+        for x in 0..4 {
+            cells[idx(x, 0)] = BLACK;
+        }
+        // Playing at (4,0) wins for BLACK.
+        assert!(wins_at(&cells, BLACK, idx(4, 0)));
+        // Playing at (5,0) does NOT win (only 3 adjacent on the other side).
+        assert!(!wins_at(&cells, BLACK, idx(5, 0)));
+        // Playing at (4,0) does NOT win for WHITE (those are BLACK stones).
+        assert!(!wins_at(&cells, WHITE, idx(4, 0)));
+        // Board with empty (4,0) — blocking at (4,0) prevents BLACK's win.
+        // wins_at confirms where the threat is.
+        cells[idx(4, 0)] = WHITE; // block
+        assert!(!wins_at(&cells, BLACK, idx(5, 0)));
     }
 }
