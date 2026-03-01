@@ -433,46 +433,40 @@ fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
     false
 }
 
-/// Heuristic threat score for `player`. Counts open and half-open runs of length 2–4.
-/// Higher score = more threatening position for that player.
+/// Heuristic threat score for `player`.
+/// Scans every 5-cell window in all four directions. Windows that contain no
+/// opponent stones are scored by how many player stones they already hold.
+/// This naturally handles broken/split patterns (e.g. XX_XX scores like a
+/// half-open four because it contributes one k=4 window).
 fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
+    let opp = if player == BLACK { WHITE } else { BLACK };
     let mut score = 0i32;
     for &(dx, dy) in &DIRS {
         for sy in 0..N as isize {
             for sx in 0..N as isize {
-                let px = sx - dx;
-                let py = sy - dy;
-                // Only start counting from the leftmost cell of a run.
-                if Board::on_board(px, py)
-                    && cells[(py * N as isize + px) as usize] == player
-                {
+                // Skip if the 5-cell window doesn't fit on the board.
+                if !Board::on_board(sx + dx * 4, sy + dy * 4) {
                     continue;
                 }
-                let mut len = 0usize;
-                let mut cx = sx;
-                let mut cy = sy;
-                while Board::on_board(cx, cy)
-                    && cells[(cy * N as isize + cx) as usize] == player
-                {
-                    len += 1;
-                    cx += dx;
-                    cy += dy;
+                let mut p_count = 0u8;
+                let mut has_opp = false;
+                for k in 0..5 {
+                    let cell = cells[((sy + dy * k) * N as isize + sx + dx * k) as usize];
+                    if cell == player {
+                        p_count += 1;
+                    } else if cell == opp {
+                        has_opp = true;
+                        break;
+                    }
                 }
-                if len == 0 || len >= 5 {
+                if has_opp {
                     continue;
                 }
-                let left_open = Board::on_board(px, py)
-                    && cells[(py * N as isize + px) as usize] == 0;
-                let right_open = Board::on_board(cx, cy)
-                    && cells[(cy * N as isize + cx) as usize] == 0;
-                let ends = left_open as usize + right_open as usize;
-                score += match (len, ends) {
-                    (4, 2) => 10_000,
-                    (4, 1) => 1_000,
-                    (3, 2) => 100,
-                    (3, 1) => 10,
-                    (2, 2) => 2,
-                    (2, 1) => 1,
+                score += match p_count {
+                    4 => 1_000,
+                    3 => 100,
+                    2 => 10,
+                    1 => 1,
                     _ => 0,
                 };
             }
@@ -1381,47 +1375,43 @@ mod tests {
 
     #[test]
     fn threat_score_and_evaluate_patterns() {
-        // Covers all match arms in threat_score and both non-draw branches of evaluate.
-        let mut c = [0u8; CELLS];
-
-        // (4, 2) open four: x=1..4, y=0; left=empty, right=empty
-        for x in 1..5 { c[idx(x, 0)] = BLACK; }
-        // (4, 1) wall-left four: x=0..3, y=1; left=wall, right=empty
-        for x in 0..4 { c[idx(x, 1)] = BLACK; }
-        // (4, 0) blocked four → `_`: x=0..3, y=2; left=wall, right=WHITE
-        for x in 0..4 { c[idx(x, 2)] = BLACK; }
-        c[idx(4, 2)] = WHITE;
-        // (4, 1) right-wall four: x=11..14, y=0; right_open off-board=false
-        for x in 11..15 { c[idx(x, 0)] = BLACK; }
-        // (3, 2) open three: x=1..3, y=3
-        for x in 1..4 { c[idx(x, 3)] = BLACK; }
-        // (3, 1) wall-left three: x=0..2, y=4
-        for x in 0..3 { c[idx(x, 4)] = BLACK; }
-        // (3, 0) blocked three → `_`: x=0..2, y=5; right=WHITE
-        for x in 0..3 { c[idx(x, 5)] = BLACK; }
-        c[idx(3, 5)] = WHITE;
-        // (2, 2) open two: x=1..2, y=6
-        for x in 1..3 { c[idx(x, 6)] = BLACK; }
-        // (2, 1) wall-left two: x=0..1, y=7
-        for x in 0..2 { c[idx(x, 7)] = BLACK; }
-        // (2, 0) blocked two → `_`: x=0..1, y=8; right=WHITE
-        for x in 0..2 { c[idx(x, 8)] = BLACK; }
-        c[idx(2, 8)] = WHITE;
-        // len=1 → `_`: isolated stone at corner
-        c[idx(14, 14)] = BLACK;
-        // len>=5 → skip: five in a row at y=9
-        for x in 0..5 { c[idx(x, 9)] = BLACK; }
-
-        let bs = threat_score(&c, BLACK);
-        assert!(bs > 0, "BLACK has many threats, score={bs}");
+        // Empty board: score 0 for both, evaluate returns draw (covers p_count=0 / `_` arm).
         assert_eq!(threat_score(&[0u8; CELLS], BLACK), 0);
+        assert_eq!(evaluate(&[0u8; CELLS]), 0);
 
-        // evaluate: BLACK wins
-        assert_eq!(evaluate(&c), BLACK);
-        // evaluate: WHITE wins
-        let mut c2 = [0u8; CELLS];
-        for x in 1..5 { c2[idx(x, 0)] = WHITE; }
-        assert_eq!(evaluate(&c2), WHITE);
+        // Single stone: several k=1 windows exist (covers p_count=1 arm).
+        let mut c1 = [0u8; CELLS];
+        c1[idx(7, 7)] = BLACK;
+        assert!(threat_score(&c1, BLACK) > 0);
+
+        // Split four XX_XX: BLACK at x=0,1,3,4 y=0.
+        // Window x=0..4 has p_count=4 (covers p_count=4 arm).
+        // Window x=1..5 has p_count=3 (covers p_count=3 arm).
+        // Window x=2..6 has p_count=2 (covers p_count=2 arm).
+        let mut cb = [0u8; CELLS];
+        for x in [0usize, 1, 3, 4] { cb[idx(x, 0)] = BLACK; }
+        let s_split = threat_score(&cb, BLACK);
+        assert!(s_split >= 1_000, "xx_xx should contain at least one k=4 window: {s_split}");
+
+        // Open four _XXXX_ at y=1, x=1..4: two k=4 windows → scores higher than split.
+        let mut c4 = [0u8; CELLS];
+        for x in 1..5 { c4[idx(x, 1)] = BLACK; }
+        let s_open = threat_score(&c4, BLACK);
+        assert!(s_open >= 2_000, "open four: two k=4 windows expected: {s_open}");
+        assert!(s_open > s_split, "open four > split four: {s_open} vs {s_split}");
+
+        // Opponent stone in window → that window skipped (covers has_opp branch).
+        let mut co = [0u8; CELLS];
+        for x in 1..5 { co[idx(x, 1)] = BLACK; }
+        co[idx(0, 1)] = WHITE; // blocks the leftmost k=4 window
+        let s_blocked = threat_score(&co, BLACK);
+        assert!(s_blocked < s_open, "opponent blocks one window: {s_blocked} < {s_open}");
+
+        // evaluate: returns correct player.
+        assert_eq!(evaluate(&c4), BLACK);
+        let mut cw = [0u8; CELLS];
+        for x in 1..5 { cw[idx(x, 0)] = WHITE; }
+        assert_eq!(evaluate(&cw), WHITE);
     }
 
     #[test]
