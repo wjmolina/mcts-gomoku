@@ -17,12 +17,10 @@
     top: 0;
     left: 0;
     transform: translate(calc(-100% - 1vmin), 0);
-    transition: transform 90ms linear;
   }
   #restart.hot {
     cursor: pointer;
   }
-  #restart.hot.down {}
   #restart_icon {
     width: 3vmin;
     height: 3vmin;
@@ -99,6 +97,14 @@ function layout() {
   restart.height = Math.round(rSize * dpr);
   rg.setTransform(dpr, 0, 0, dpr, 0, 0);
   drawRestartTile(rSize);
+}
+
+function restartSize() {
+  return Math.max(1, restart.getBoundingClientRect().width);
+}
+
+function redrawRestart() {
+  drawRestartTile(restartSize());
 }
 
 function drawRestartTile(s) {
@@ -186,7 +192,7 @@ function drawBoard() {
 
 function draw() {
   setRestartIcon();
-  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+  redrawRestart();
   drawBoard();
   if (!state || state.status !== 'matched') {
     c.style.cursor = 'default';
@@ -258,11 +264,14 @@ async function connectAndJoin() {
 async function restartGame() {
   if (thinking) return;
   hover = null;
-  state = { status: 'waiting' };
-  playerId = null;
-  localStorage.removeItem('player_id');
+  if (!playerId) {
+    state = { status: 'waiting' };
+    draw();
+    await connectAndJoin();
+    return;
+  }
+  state = await postJson('/restart', { player_id: playerId });
   draw();
-  await connectAndJoin();
 }
 
 function restartLocalPos(e) {
@@ -302,7 +311,8 @@ function startPolling() {
 c.addEventListener('click', async e => {
   if (!state || state.status !== 'matched' || state.over || thinking) return;
   if (state.turn !== state.side) return;
-  const q = pick(...Object.values(mousePos(e)));
+  const { mx, my } = mousePos(e);
+  const q = pick(mx, my);
   if (!q || state.board[idx(q.x, q.y)] !== E) return;
   await play(q.x, q.y);
 });
@@ -312,7 +322,8 @@ c.addEventListener('mousemove', e => {
     if (hover) { hover = null; draw(); }
     return;
   }
-  const q = pick(...Object.values(mousePos(e)));
+  const { mx, my } = mousePos(e);
+  const q = pick(mx, my);
   const next = q && state.board[idx(q.x, q.y)] === E ? q : null;
   if ((hover?.x ?? -1) !== (next?.x ?? -1) || (hover?.y ?? -1) !== (next?.y ?? -1)) {
     hover = next;
@@ -324,25 +335,23 @@ c.addEventListener('mouseleave', () => { if (hover) { hover = null; draw(); } })
 restart.addEventListener('mousemove', e => {
   restartHot = restartHit(e);
   restart.classList.toggle('hot', restartHot);
-  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+  redrawRestart();
 });
 restart.addEventListener('mouseleave', () => {
   restartHot = false;
   restartDown = false;
-  restart.classList.remove('hot', 'down');
-  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+  restart.classList.remove('hot');
+  redrawRestart();
 });
 restart.addEventListener('mousedown', e => {
   if (restartHit(e)) {
     restartDown = true;
-    restart.classList.add('down');
-    drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+    redrawRestart();
   }
 });
 restart.addEventListener('mouseup', () => {
   restartDown = false;
-  restart.classList.remove('down');
-  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+  redrawRestart();
 });
 restart.addEventListener('click', async e => {
   if (!restartHit(e)) return;

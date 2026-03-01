@@ -126,7 +126,14 @@ def player_state(player_id: str) -> dict:
             "player_id": player_id,
         }
 
-    g = GAMES[gid]
+    g = GAMES.get(gid)
+    if g is None:
+        p["game_id"] = None
+        p["side"] = None
+        return {
+            "status": "waiting",
+            "player_id": player_id,
+        }
     return {
         "status": "matched",
         "player_id": player_id,
@@ -153,8 +160,6 @@ def ensure_player(player_id: Optional[str]) -> str:
 def maybe_match(player_id: str) -> None:
     p = PLAYERS[player_id]
     if p["game_id"] is not None:
-        return
-    if player_id in QUEUE:
         return
 
     prune_waiting_players()
@@ -183,6 +188,32 @@ def maybe_match(player_id: str) -> None:
     PLAYERS[black_id]["side"] = BLACK
     PLAYERS[white_id]["game_id"] = gid
     PLAYERS[white_id]["side"] = WHITE
+
+
+def restart_player(player_id: str) -> None:
+    p = PLAYERS[player_id]
+    gid = p["game_id"]
+    if gid is None:
+        maybe_match(player_id)
+        return
+
+    g = GAMES.pop(gid, None)
+    participants = [player_id]
+    if g is not None:
+        participants = list(g["players"].values())
+
+    for pid in participants:
+        q = PLAYERS.get(pid)
+        if not q:
+            continue
+        if q["game_id"] != gid:
+            continue
+        q["game_id"] = None
+        q["side"] = None
+        if pid not in QUEUE:
+            QUEUE.append(pid)
+
+    maybe_match(player_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -242,6 +273,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             touch(pid)
             maybe_match(pid)
+            self._send_json(200, player_state(pid))
+            return
+
+        if parsed.path == "/restart":
+            payload = self._read_json()
+            pid = payload.get("player_id")
+            if not pid or pid not in PLAYERS:
+                self._send_json(404, {"error": "player not found"})
+                return
+            touch(pid)
+            restart_player(pid)
             self._send_json(200, player_state(pid))
             return
 
