@@ -1,0 +1,217 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcts-gomoku</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body { display: grid; place-items: center; background: #d9c7aa; overflow: hidden; }
+  canvas { display: block; width: min(90vw, 90vh); height: min(90vw, 90vh); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const N = 15, E = 0;
+const BOARD_BG = '#cda66f', GRID = 'rgba(63,43,24,0.82)';
+const BLACK = '#22262e', WHITE = '#ebe5da';
+
+const c = document.getElementById('c');
+const g = c.getContext('2d');
+
+let state = null;
+let playerId = localStorage.getItem('player_id') || null;
+let thinking = false;
+let hover = null;
+let size = 0, step = 0, lineW = 0, stoneR = 0, start = 0;
+let pollTimer = null;
+
+const idx = (x, y) => y * N + x;
+const p = i => start + i * step;
+
+function markerSize() { return Math.max(6, step * 0.18); }
+function drawMarker(x, y, color) {
+  const r = markerSize() / 2;
+  g.beginPath();
+  g.arc(x, y, r, 0, Math.PI * 2);
+  g.fillStyle = color;
+  g.fill();
+}
+
+function layout() {
+  const dpr = window.devicePixelRatio || 1;
+  size = Math.max(1, c.getBoundingClientRect().width);
+  c.width = Math.round(size * dpr);
+  c.height = Math.round(size * dpr);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  lineW = Math.max(1, size * 0.0026);
+  step = (size * 0.94) / (N - 1);
+  stoneR = step * 0.425;
+  start = stoneR + lineW / 2;
+  c.style.borderRadius = `${stoneR}px`;
+}
+
+function drawStone(cx, cy, isBlack) {
+  const grad = g.createRadialGradient(cx - stoneR * 0.34, cy - stoneR * 0.36, stoneR * 0.14, cx, cy, stoneR);
+  if (isBlack) {
+    grad.addColorStop(0, '#747a86');
+    grad.addColorStop(0.35, BLACK);
+    grad.addColorStop(1, '#0d1016');
+  } else {
+    grad.addColorStop(0, '#fffdf7');
+    grad.addColorStop(0.48, WHITE);
+    grad.addColorStop(1, '#d8d0c2');
+  }
+  g.beginPath();
+  g.arc(cx, cy, stoneR, 0, Math.PI * 2);
+  g.fillStyle = grad;
+  g.shadowColor = isBlack ? 'rgba(0,0,0,0.20)' : 'rgba(0,0,0,0.13)';
+  g.shadowBlur = stoneR * (isBlack ? 0.20 : 0.15);
+  g.shadowOffsetY = stoneR * 0.07;
+  g.fill();
+  g.shadowColor = 'transparent';
+  g.strokeStyle = isBlack ? '#0a0c10' : '#ddd4c5';
+  g.lineWidth = Math.max(isBlack ? 1 : 0.6, stoneR * (isBlack ? 0.075 : 0.04));
+  g.stroke();
+}
+
+function drawBoard() {
+  g.clearRect(0, 0, size, size);
+  g.fillStyle = BOARD_BG;
+  g.fillRect(0, 0, size, size);
+
+  const v = g.createRadialGradient(size / 2, size / 2, size * 0.3, size / 2, size / 2, size * 0.7);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.08)');
+  g.fillStyle = v;
+  g.fillRect(0, 0, size, size);
+
+  g.strokeStyle = GRID;
+  g.lineWidth = lineW;
+  for (let i = 0; i < N; i++) {
+    const q = p(i);
+    g.beginPath(); g.moveTo(start, q); g.lineTo(p(N - 1), q); g.stroke();
+    g.beginPath(); g.moveTo(q, start); g.lineTo(q, p(N - 1)); g.stroke();
+  }
+
+  const stars = [3, 7, 11];
+  for (const sx of stars) for (const sy of stars) drawMarker(p(sx), p(sy), '#4a3018');
+}
+
+function draw() {
+  drawBoard();
+  if (!state || state.status !== 'matched') return;
+
+  const myTurn = state.side === state.turn;
+  if (!state.over && !thinking && myTurn && hover && state.board[idx(hover.x, hover.y)] === E) {
+    drawMarker(p(hover.x), p(hover.y), '#ffd84d');
+  }
+
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const v = state.board[idx(x, y)];
+    if (v) drawStone(p(x), p(y), v === 1);
+  }
+
+  if (state.last_move) drawMarker(p(state.last_move[0]), p(state.last_move[1]), '#ffd84d');
+  if (state.over && state.win_marks && state.win_marks.length) {
+    for (const m of state.win_marks) drawMarker(p(m[0]), p(m[1]), '#ffd84d');
+  }
+}
+
+function pick(mx, my) {
+  const x = Math.round((mx - start) / step);
+  const y = Math.round((my - start) / step);
+  if (x < 0 || x >= N || y < 0 || y >= N) return null;
+  return { x, y };
+}
+
+function mousePos(e) {
+  const r = c.getBoundingClientRect();
+  return { mx: e.clientX - r.left, my: e.clientY - r.top };
+}
+
+async function postJson(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${path} failed`);
+  return r.json();
+}
+
+async function getJson(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path} failed`);
+  return r.json();
+}
+
+async function refreshState() {
+  if (!playerId) return;
+  try {
+    state = await getJson(`/state?player_id=${encodeURIComponent(playerId)}`);
+    draw();
+  } catch (_) {}
+}
+
+async function connectAndJoin() {
+  const cRes = await postJson('/connect', { player_id: playerId });
+  playerId = cRes.player_id;
+  localStorage.setItem('player_id', playerId);
+  state = await postJson('/join', { player_id: playerId });
+  draw();
+}
+
+async function play(x, y) {
+  thinking = true;
+  hover = null;
+  c.style.cursor = 'progress';
+  draw();
+  try {
+    state = await postJson('/play', { player_id: playerId, x, y });
+  } finally {
+    thinking = false;
+    c.style.cursor = 'default';
+    draw();
+  }
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refreshState, 1000);
+}
+
+c.addEventListener('click', async e => {
+  if (!state || state.status !== 'matched' || state.over || thinking) return;
+  if (state.turn !== state.side) return;
+  const q = pick(...Object.values(mousePos(e)));
+  if (!q || state.board[idx(q.x, q.y)] !== E) return;
+  await play(q.x, q.y);
+});
+
+c.addEventListener('mousemove', e => {
+  if (!state || state.status !== 'matched' || state.over || thinking || state.turn !== state.side) {
+    if (hover) { hover = null; draw(); }
+    return;
+  }
+  const q = pick(...Object.values(mousePos(e)));
+  const next = q && state.board[idx(q.x, q.y)] === E ? q : null;
+  if ((hover?.x ?? -1) !== (next?.x ?? -1) || (hover?.y ?? -1) !== (next?.y ?? -1)) {
+    hover = next;
+    draw();
+  }
+});
+
+c.addEventListener('mouseleave', () => { if (hover) { hover = null; draw(); } });
+window.addEventListener('resize', () => { layout(); draw(); });
+
+(async function init() {
+  layout();
+  draw();
+  await connectAndJoin();
+  startPolling();
+})();
+</script>
+</body>
+</html>
