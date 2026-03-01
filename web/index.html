@@ -101,9 +101,14 @@ function drawBoard() {
 
 function draw() {
   drawBoard();
-  if (!state || state.status !== 'matched') return;
+  if (!state || state.status !== 'matched') {
+    c.style.cursor = 'default';
+    return;
+  }
 
   const myTurn = state.side === state.turn;
+  c.style.cursor = (!state.over && !thinking && myTurn) ? 'pointer' : 'default';
+
   if (!state.over && !thinking && myTurn && hover && state.board[idx(hover.x, hover.y)] === E) {
     drawMarker(p(hover.x), p(hover.y), '#ffd84d');
   }

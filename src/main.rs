@@ -236,6 +236,18 @@ fn move_to_xy(mv: usize) -> (usize, usize) {
     (mv % N, mv / N)
 }
 
+fn opening_move(board: &Board) -> Option<usize> {
+    if board.moves_played == 0 {
+        Some(idx(N / 2, N / 2))
+    } else {
+        None
+    }
+}
+
+fn idx(x: usize, y: usize) -> usize {
+    y * N + x
+}
+
 fn node_at(arena: &Arena, idx: usize) -> Arc<Node> {
     arena.lock().unwrap()[idx].clone()
 }
@@ -475,6 +487,12 @@ fn run(args: &[String]) -> i32 {
         return 1;
     }
 
+    if let Some(mv) = opening_move(&board) {
+        let (x, y) = move_to_xy(mv);
+        println!("best={} {}, visits=0, winrate=0.0000, elapsed=0s, threads=0, nodes=0 (opening)", x, y);
+        return 0;
+    }
+
     let root = Node {
         visits: AtomicU64::new(0),
         win_halves: AtomicU64::new(0),
@@ -514,7 +532,7 @@ fn run(args: &[String]) -> i32 {
     let tactical_topk = env::var("MCTS_TACTICAL_TOPK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(3);
+        .unwrap_or(225);
 
     let mut handles = Vec::with_capacity(threads);
     for i in 0..threads {
@@ -635,6 +653,16 @@ mod tests {
         assert_eq!(b.side, WHITE);
         assert_eq!(b.moves_played, 1);
         assert_eq!(b.last, Some(idx(3, 4)));
+    }
+
+    #[test]
+    fn opening_move_empty_and_non_empty() {
+        let b = Board::new();
+        assert_eq!(opening_move(&b), Some(idx(7, 7)));
+
+        let mut b2 = Board::new();
+        b2.play(idx(0, 0));
+        assert_eq!(opening_move(&b2), None);
     }
 
     #[test]
@@ -1244,5 +1272,13 @@ mod tests {
         env::remove_var("MCTS_SECONDS");
         env::remove_var("MCTS_TACTICAL_DEPTH");
         env::remove_var("MCTS_TACTICAL_TOPK");
+    }
+
+    #[test]
+    fn run_executes_opening_center_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("MCTS_SECONDS");
+        env::remove_var("MCTS_ITERS");
+        assert_eq!(run(&[]), 0);
     }
 }
