@@ -306,7 +306,7 @@ fn transform_index(sym: usize, cell: usize) -> usize {
         7 => (N - 1 - y, N - 1 - x),
         _ => unreachable!(),
     };
-    ty * N + tx
+    idx(tx, ty)
 }
 
 /// Canonical transposition key under all D4 board symmetries plus side-to-move.
