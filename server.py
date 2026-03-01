@@ -292,7 +292,6 @@ def main():
     if not INDEX_PATH.exists():
         raise FileNotFoundError(f"missing frontend: {INDEX_PATH}")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"listening on http://{HOST}:{PORT}")
     server.serve_forever()
 
 

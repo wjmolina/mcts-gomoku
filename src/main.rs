@@ -10,6 +10,14 @@ const CELLS: usize = N * N;
 const BLACK: u8 = 1;
 const WHITE: u8 = 2;
 const DIRS: [(isize, isize); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
+const UCT_C: f32 = std::f32::consts::SQRT_2;
+const BACKPROP_WIN: u64 = 2;
+const BACKPROP_DRAW: u64 = 1;
+const BACKPROP_LOSS: u64 = 0;
+const PATH_CAPACITY: usize = 256;
+
+type Move = u16;
+type NodeId = usize;
 
 #[derive(Clone)]
 struct Board {
@@ -29,14 +37,52 @@ impl Board {
         }
     }
 
-    fn legal_moves(&self) -> Vec<u16> {
+    fn legal_moves(&self) -> Vec<Move> {
         let mut out = Vec::with_capacity(CELLS - self.moves_played);
         for i in 0..CELLS {
             if self.cells[i] == 0 {
-                out.push(i as u16);
+                out.push(i as Move);
             }
         }
         out
+    }
+
+    fn local_moves(&self, radius: usize) -> Vec<Move> {
+        if self.moves_played == 0 || radius == 0 {
+            return self.legal_moves();
+        }
+
+        let mut out = Vec::with_capacity(CELLS - self.moves_played);
+        for y in 0..N {
+            for x in 0..N {
+                let i = idx(x, y);
+                if self.cells[i] != 0 {
+                    continue;
+                }
+                let x0 = x.saturating_sub(radius);
+                let y0 = y.saturating_sub(radius);
+                let x1 = (x + radius).min(N - 1);
+                let y1 = (y + radius).min(N - 1);
+                let mut near = false;
+                'scan: for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if self.cells[idx(nx, ny)] != 0 {
+                            near = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                if near {
+                    out.push(i as Move);
+                }
+            }
+        }
+
+        if out.is_empty() {
+            self.legal_moves()
+        } else {
+            out
+        }
     }
 
     fn play(&mut self, mv: usize) {
@@ -58,16 +104,22 @@ impl Board {
         for (dx, dy) in DIRS {
             let mut count = 1;
             let mut i = 1;
-            while Self::on_board(x + dx * i, y + dy * i)
-                && self.cells[((y + dy * i) as usize) * N + (x + dx * i) as usize] == p
-            {
+            while Self::on_board(x + dx * i, y + dy * i) {
+                let nx = (x + dx * i) as usize;
+                let ny = (y + dy * i) as usize;
+                if self.cells[idx(nx, ny)] != p {
+                    break;
+                }
                 count += 1;
                 i += 1;
             }
             i = 1;
-            while Self::on_board(x - dx * i, y - dy * i)
-                && self.cells[((y - dy * i) as usize) * N + (x - dx * i) as usize] == p
-            {
+            while Self::on_board(x - dx * i, y - dy * i) {
+                let nx = (x - dx * i) as usize;
+                let ny = (y - dy * i) as usize;
+                if self.cells[idx(nx, ny)] != p {
+                    break;
+                }
                 count += 1;
                 i += 1;
             }
@@ -98,18 +150,106 @@ struct Node {
     win_halves: AtomicU64,
     virtual_loss: AtomicU64,
     terminal: Option<u8>,
-    untried: Mutex<Vec<u16>>,
-    children: Mutex<Vec<(u16, usize)>>,
+    untried: Mutex<Vec<Move>>,
+    children: Mutex<Vec<(Move, NodeId)>>,
 }
 
 type Arena = Arc<Mutex<Vec<Arc<Node>>>>;
 type Tt = Arc<TtSharded>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Candidate {
+    mv: usize,
+    visits: u64,
+    winrate: f64,
+}
+
 const SIDE_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
 const TT_SHARDS: usize = 64;
+const ENV_LOCAL_RADIUS: &str = "MCTS_LOCAL_RADIUS";
+const ENV_SECONDS: &str = "MCTS_SECONDS";
+const ENV_ITERS: &str = "MCTS_ITERS";
+const ENV_SEED: &str = "MCTS_SEED";
+const ENV_EARLY_STOP_RATIO: &str = "MCTS_EARLY_STOP_RATIO";
+const ENV_EARLY_STOP_MIN_VISITS: &str = "MCTS_EARLY_STOP_MIN_VISITS";
+const ENV_TACTICAL_DEPTH: &str = "MCTS_TACTICAL_DEPTH";
+const ENV_TACTICAL_TOPK: &str = "MCTS_TACTICAL_TOPK";
+const ENV_DEBUG: &str = "MCTS_DEBUG";
+
+#[derive(Clone, Copy)]
+struct EngineConfig {
+    local_radius: usize,
+    seconds: u64,
+    max_iters: Option<u64>,
+    seed_base: Option<u64>,
+    early_stop_ratio: f64,
+    early_stop_min_visits: u64,
+    tactical_depth: usize,
+    tactical_topk: usize,
+    debug: bool,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            local_radius: 2,
+            seconds: 1,
+            max_iters: None,
+            seed_base: None,
+            early_stop_ratio: 0.99,
+            early_stop_min_visits: 10_000,
+            tactical_depth: 2,
+            tactical_topk: 225,
+            debug: false,
+        }
+    }
+}
+
+impl EngineConfig {
+    fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+        env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<T>().ok())
+            .unwrap_or(default)
+    }
+
+    fn parse_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
+        env::var(key).ok().and_then(|v| v.parse::<T>().ok())
+    }
+
+    /// Parses all engine hyperparameters from environment with defaults.
+    fn from_env() -> Self {
+        let mut cfg = Self::default();
+        cfg.local_radius = Self::parse_or(ENV_LOCAL_RADIUS, cfg.local_radius);
+        cfg.seconds = Self::parse_or(ENV_SECONDS, cfg.seconds);
+        cfg.max_iters = Self::parse_opt(ENV_ITERS);
+        cfg.seed_base = Self::parse_opt(ENV_SEED);
+        cfg.early_stop_ratio = Self::parse_or(ENV_EARLY_STOP_RATIO, cfg.early_stop_ratio);
+        cfg.early_stop_min_visits =
+            Self::parse_or(ENV_EARLY_STOP_MIN_VISITS, cfg.early_stop_min_visits);
+        cfg.tactical_depth = Self::parse_or(ENV_TACTICAL_DEPTH, cfg.tactical_depth);
+        cfg.tactical_topk = Self::parse_or(ENV_TACTICAL_TOPK, cfg.tactical_topk);
+        cfg.debug = matches!(env::var(ENV_DEBUG).ok().as_deref(), Some("1"));
+        cfg
+    }
+}
 
 struct TtSharded {
-    shards: Vec<Mutex<HashMap<u64, usize>>>,
+    shards: Vec<Mutex<HashMap<u64, NodeId>>>,
+}
+
+#[derive(Clone, Copy)]
+struct SearchSnapshot {
+    best_mv_mcts: Option<usize>,
+    best_visits: u64,
+    node_count: usize,
+    total_visits: u64,
+}
+
+struct RootAnalysis {
+    snapshot: SearchSnapshot,
+    ranked: Vec<Candidate>,
+    root_untried: usize,
 }
 
 impl TtSharded {
@@ -125,7 +265,7 @@ impl TtSharded {
         (hash as usize) & (TT_SHARDS - 1)
     }
 
-    fn get_or_insert_with<F: FnOnce() -> usize>(&self, hash: u64, create: F) -> usize {
+    fn get_or_insert_with<F: FnOnce() -> NodeId>(&self, hash: u64, create: F) -> NodeId {
         let mut shard = self.shards[Self::shard_idx(hash)].lock().unwrap();
         if let Some(&idx) = shard.get(&hash) {
             idx
@@ -136,7 +276,7 @@ impl TtSharded {
         }
     }
 
-    fn insert(&self, hash: u64, idx: usize) {
+    fn insert(&self, hash: u64, idx: NodeId) {
         self.shards[Self::shard_idx(hash)]
             .lock()
             .unwrap()
@@ -172,22 +312,23 @@ fn transform_index(sym: usize, cell: usize) -> usize {
     ty * N + tx
 }
 
+/// Canonical transposition key under all D4 board symmetries plus side-to-move.
 fn canonical_hash(cells: &[u8; CELLS], side: u8) -> u64 {
-    let mut hs = [0u64; 8];
+    let mut hashes = [0u64; 8];
     for (cell, p) in cells.iter().copied().enumerate() {
         if p == 0 {
             continue;
         }
-        for (s, h) in hs.iter_mut().enumerate() {
+        for (s, h) in hashes.iter_mut().enumerate() {
             *h ^= piece_hash(transform_index(s, cell), p);
         }
     }
     if side == WHITE {
-        for h in &mut hs {
+        for h in &mut hashes {
             *h ^= SIDE_HASH;
         }
     }
-    hs.into_iter().min().unwrap()
+    hashes.into_iter().min().unwrap()
 }
 
 struct Rng(u64);
@@ -217,7 +358,7 @@ fn uct(child_win_halves: u64, child_visits: u64, child_vl: u64, parent_visits: u
         return f32::INFINITY;
     }
     let q = (child_win_halves as f32) / (2.0 * v as f32);
-    let u = 1.4142135 * ((parent_visits.max(1) as f32).ln() / v as f32).sqrt();
+    let u = UCT_C * ((parent_visits.max(1) as f32).ln() / v as f32).sqrt();
     q + u
 }
 
@@ -248,26 +389,26 @@ fn idx(x: usize, y: usize) -> usize {
     y * N + x
 }
 
-fn node_at(arena: &Arena, idx: usize) -> Arc<Node> {
+fn node_at(arena: &Arena, idx: NodeId) -> Arc<Node> {
     arena.lock().unwrap()[idx].clone()
 }
 
-fn add_child(arena: &Arena, node: Node) -> usize {
+fn add_child(arena: &Arena, node: Node) -> NodeId {
     let mut a = arena.lock().unwrap();
     a.push(Arc::new(node));
     a.len() - 1
 }
 
-fn tt_with_root(hash: u64, idx: usize) -> Tt {
+fn tt_with_root(hash: u64, idx: NodeId) -> Tt {
     let tt = Arc::new(TtSharded::new());
     tt.insert(hash, idx);
     tt
 }
 
-fn rollout(mut board: Board, rng: &mut Rng) -> u8 {
+fn rollout(mut board: Board, rng: &mut Rng, local_radius: usize) -> u8 {
     let mut outcome = board.terminal();
     while outcome.is_none() {
-        let legal = board.legal_moves();
+        let legal = board.local_moves(local_radius);
         let mv = legal[rng.gen_usize(legal.len())] as usize;
         board.play(mv);
         outcome = board.terminal();
@@ -275,31 +416,44 @@ fn rollout(mut board: Board, rng: &mut Rng) -> u8 {
     outcome.unwrap()
 }
 
-fn best_root_child(arena: &Arena) -> (Option<usize>, u64, f64, usize, u64) {
+fn analyze_root(arena: &Arena) -> RootAnalysis {
     let root_node = node_at(arena, 0);
     let kids = root_node.children.lock().unwrap().clone();
+    let root_untried = root_node.untried.lock().unwrap().len();
     let node_count = arena.lock().unwrap().len();
     let total_visits = root_node.visits.load(Ordering::Relaxed);
 
-    let mut best_mv = None::<usize>;
+    let mut ranked = Vec::<Candidate>::with_capacity(kids.len());
+    let mut best_mv_mcts = None;
     let mut best_visits = 0u64;
-    let mut best_wr = 0.0f64;
 
     for (mv_u16, c) in kids {
         let cn = node_at(arena, c);
-        let v = cn.visits.load(Ordering::Relaxed);
-        if v == 0 {
-            continue;
+        let visits = cn.visits.load(Ordering::Relaxed);
+        let win_halves = cn.win_halves.load(Ordering::Relaxed);
+        let cand = Candidate {
+            mv: mv_u16 as usize,
+            visits,
+            winrate: win_halves as f64 / (2.0 * visits.max(1) as f64),
+        };
+        if visits > best_visits {
+            best_visits = visits;
+            best_mv_mcts = Some(cand.mv);
         }
-        if v > best_visits {
-            best_visits = v;
-            let w = cn.win_halves.load(Ordering::Relaxed);
-            best_wr = w as f64 / (2.0 * v as f64);
-            best_mv = Some(mv_u16 as usize);
-        }
+        ranked.push(cand);
     }
+    ranked.sort_by(|a, b| b.visits.cmp(&a.visits));
 
-    (best_mv, best_visits, best_wr, node_count, total_visits)
+    RootAnalysis {
+        snapshot: SearchSnapshot {
+            best_mv_mcts,
+            best_visits,
+            node_count,
+            total_visits,
+        },
+        ranked,
+        root_untried,
+    }
 }
 
 fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
@@ -328,13 +482,15 @@ fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
     best
 }
 
-fn tactical_pick(board: &Board, candidates: &[(usize, u64, f64)], depth: usize) -> Option<usize> {
+/// Picks forced win first, otherwise first non-losing move from ranked candidates.
+fn tactical_pick(board: &Board, candidates: &[Candidate], depth: usize) -> Option<usize> {
     if depth == 0 || candidates.is_empty() {
         return None;
     }
 
     let mut first_non_losing = None::<usize>;
-    for &(mv, _, _) in candidates {
+    for c in candidates {
+        let mv = c.mv;
         let mut b2 = board.clone();
         b2.play(mv);
         let score_for_root = -alpha_beta(&b2, depth.saturating_sub(1), -1, 1);
@@ -348,6 +504,129 @@ fn tactical_pick(board: &Board, candidates: &[(usize, u64, f64)], depth: usize) 
     first_non_losing
 }
 
+fn apply_moves(board: &mut Board, args: &[String]) -> Result<(), String> {
+    for a in args {
+        match parse_move(a) {
+            Some(mv) if board.cells[mv] == 0 => board.play(mv),
+            _ => {
+                return Err(format!(
+                    "invalid move: {a} (expected x,y in 0..14 and legal)"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn make_root_node(board: &Board, cfg: EngineConfig) -> Node {
+    Node {
+        visits: AtomicU64::new(0),
+        win_halves: AtomicU64::new(0),
+        virtual_loss: AtomicU64::new(0),
+        terminal: board.terminal(),
+        untried: Mutex::new(board.local_moves(cfg.local_radius)),
+        children: Mutex::new(Vec::new()),
+    }
+}
+
+fn spawn_workers(
+    threads: usize,
+    board: &Board,
+    root_player: u8,
+    stop: &Arc<AtomicBool>,
+    arena: &Arena,
+    tt: &Tt,
+    cfg: EngineConfig,
+) -> Vec<thread::JoinHandle<()>> {
+    let mut handles = Vec::with_capacity(threads);
+    for i in 0..threads {
+        let stop_c = stop.clone();
+        let arena_c = arena.clone();
+        let tt_c = tt.clone();
+        let root_c = board.clone();
+        handles.push(thread::spawn(move || {
+            worker(i, root_c, root_player, stop_c, arena_c, tt_c, cfg);
+        }));
+    }
+    handles
+}
+
+fn print_opening_choice(mv: usize) {
+    let (x, y) = move_to_xy(mv);
+    println!(
+        "best={} {}, visits=0, winrate=0.0000, elapsed=0s, threads=0, nodes=0 (opening)",
+        x, y
+    );
+}
+
+fn print_search_choice(c: Candidate, elapsed_s: u64, threads: usize, node_count: usize) {
+    let (x, y) = move_to_xy(c.mv);
+    println!(
+        "best={} {}, visits={}, winrate={:.4}, elapsed={}s, threads={}, nodes={} (shared tree, unbounded growth)",
+        x, y, c.visits, c.winrate, elapsed_s, threads, node_count
+    );
+}
+
+fn print_move_result(mv: usize) {
+    let (x, y) = move_to_xy(mv);
+    println!("{x},{y}");
+}
+
+fn candidate_for_mv(ranked: &[Candidate], mv: usize) -> Candidate {
+    ranked
+        .iter()
+        .find(|c| c.mv == mv)
+        .copied()
+        .unwrap_or(Candidate {
+            mv,
+            visits: 0,
+            winrate: 0.0,
+        })
+}
+
+fn merged_root_candidates(board: &Board, ranked: &[Candidate]) -> Vec<Candidate> {
+    let mut by_move = HashMap::<usize, Candidate>::with_capacity(ranked.len());
+    for c in ranked {
+        by_move.insert(c.mv, *c);
+    }
+
+    let mut out = Vec::<Candidate>::with_capacity(board.legal_moves().len());
+    for mv in board.legal_moves() {
+        let m = mv as usize;
+        out.push(by_move.get(&m).copied().unwrap_or(Candidate {
+            mv: m,
+            visits: 0,
+            winrate: 0.0,
+        }));
+    }
+    out.sort_by(|a, b| b.visits.cmp(&a.visits));
+    out
+}
+
+fn maybe_print_debug(
+    cfg: EngineConfig,
+    root_expanded: usize,
+    root_unexpanded: usize,
+    tactical_chosen: bool,
+    mcts_chosen: bool,
+    total_root_visits: u64,
+) {
+    if cfg.debug {
+        eprintln!(
+            "debug: root_expanded={}, root_unexpanded={}, ranked={}, tactical_depth={}, tactical_topk={}, tactical_chosen={}, mcts_chosen={}, total_root_visits={}",
+            root_expanded,
+            root_unexpanded,
+            root_expanded,
+            cfg.tactical_depth,
+            cfg.tactical_topk,
+            tactical_chosen,
+            mcts_chosen,
+            total_root_visits
+        );
+    }
+}
+
+/// One MCTS worker operating on the shared arena/TT.
 fn worker(
     id: usize,
     root: Board,
@@ -355,23 +634,24 @@ fn worker(
     stop: Arc<AtomicBool>,
     arena: Arena,
     tt: Tt,
-    max_iters: Option<u64>,
+    cfg: EngineConfig,
 ) {
-    let seed =
-        Instant::now().elapsed().as_nanos() as u64 ^ ((id as u64) << 32) ^ 0x9E3779B97F4A7C15;
+    let seed = cfg.seed_base.unwrap_or_else(|| Instant::now().elapsed().as_nanos() as u64)
+        ^ ((id as u64) << 32)
+        ^ 0x9E3779B97F4A7C15;
     let mut rng = Rng::new(seed);
     let mut iters = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
-        if let Some(limit) = max_iters {
+        if let Some(limit) = cfg.max_iters {
             if iters >= limit {
                 break;
             }
         }
         iters += 1;
         let mut board = root.clone();
-        let mut path = Vec::<usize>::with_capacity(256);
-        let mut vl_path = Vec::<usize>::with_capacity(256);
+        let mut path = Vec::<NodeId>::with_capacity(PATH_CAPACITY);
+        let mut vl_path = Vec::<NodeId>::with_capacity(PATH_CAPACITY);
         let mut node_idx = 0usize;
         path.push(0);
 
@@ -402,23 +682,23 @@ fn worker(
                         win_halves: AtomicU64::new(0),
                         virtual_loss: AtomicU64::new(0),
                         terminal: child_terminal,
-                        untried: Mutex::new(board.legal_moves()),
+                        untried: Mutex::new(board.local_moves(cfg.local_radius)),
                         children: Mutex::new(Vec::new()),
                     };
                     add_child(&arena, child)
                 });
-                node.children.lock().unwrap().push((mv as u16, child_idx));
+                node.children.lock().unwrap().push((mv as Move, child_idx));
                 path.push(child_idx);
 
                 if let Some(t) = child_terminal {
                     break t;
                 }
-                break rollout(board, &mut rng);
+                break rollout(board, &mut rng, cfg.local_radius);
             }
 
             let kids = node.children.lock().unwrap().clone();
             if kids.is_empty() {
-                break rollout(board, &mut rng);
+                break rollout(board, &mut rng, cfg.local_radius);
             }
 
             let parent_visits = node.visits.load(Ordering::Relaxed).max(1);
@@ -449,11 +729,11 @@ fn worker(
         };
 
         let reward = if outcome == root_player {
-            2
+            BACKPROP_WIN
         } else if outcome == 0 {
-            1
+            BACKPROP_DRAW
         } else {
-            0
+            BACKPROP_LOSS
         };
 
         for idx in path {
@@ -470,16 +750,12 @@ fn worker(
 }
 
 fn run(args: &[String]) -> i32 {
+    let cfg = EngineConfig::from_env();
     let mut board = Board::new();
 
-    for a in args {
-        match parse_move(a) {
-            Some(mv) if board.cells[mv] == 0 => board.play(mv),
-            _ => {
-                eprintln!("invalid move: {a} (expected x,y in 0..14 and legal)");
-                return 1;
-            }
-        }
+    if let Err(msg) = apply_moves(&mut board, args) {
+        eprintln!("{msg}");
+        return 1;
     }
 
     if board.terminal().is_some() {
@@ -488,20 +764,14 @@ fn run(args: &[String]) -> i32 {
     }
 
     if let Some(mv) = opening_move(&board) {
-        let (x, y) = move_to_xy(mv);
-        println!("best={} {}, visits=0, winrate=0.0000, elapsed=0s, threads=0, nodes=0 (opening)", x, y);
+        if cfg.debug {
+            print_opening_choice(mv);
+        }
+        print_move_result(mv);
         return 0;
     }
 
-    let root = Node {
-        visits: AtomicU64::new(0),
-        win_halves: AtomicU64::new(0),
-        virtual_loss: AtomicU64::new(0),
-        terminal: board.terminal(),
-        untried: Mutex::new(board.legal_moves()),
-        children: Mutex::new(Vec::new()),
-    };
-
+    let root = make_root_node(&board, cfg);
     let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
     let tt: Tt = tt_with_root(board.tt_key(), 0usize);
     let root_player = board.side;
@@ -509,103 +779,62 @@ fn run(args: &[String]) -> i32 {
         .map(|n| n.get())
         .unwrap_or(1);
     let stop = Arc::new(AtomicBool::new(false));
-
-    let seconds = env::var("MCTS_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let max_iters = env::var("MCTS_ITERS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    let early_stop_ratio = env::var("MCTS_EARLY_STOP_RATIO")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.98);
-    let early_stop_min_visits = env::var("MCTS_EARLY_STOP_MIN_VISITS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10_000);
-    let tactical_depth = env::var("MCTS_TACTICAL_DEPTH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2);
-    let tactical_topk = env::var("MCTS_TACTICAL_TOPK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(225);
-
-    let mut handles = Vec::with_capacity(threads);
-    for i in 0..threads {
-        let stop_c = stop.clone();
-        let arena_c = arena.clone();
-        let tt_c = tt.clone();
-        let root_c = board.clone();
-        let max_iters_c = max_iters;
-        handles.push(thread::spawn(move || {
-            worker(i, root_c, root_player, stop_c, arena_c, tt_c, max_iters_c);
-        }));
-    }
+    let handles = spawn_workers(threads, &board, root_player, &stop, &arena, &tt, cfg);
 
     let start = Instant::now();
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        let (best_mv_mcts, best_visits, _best_wr_mcts, node_count, total_visits) =
-            best_root_child(&arena);
+        let analysis = analyze_root(&arena);
+        let snap = analysis.snapshot;
+        let ranked = analysis.ranked;
+        let tactical_candidates = merged_root_candidates(&board, &ranked);
 
-        let root_node = node_at(&arena, 0);
-        let kids = root_node.children.lock().unwrap().clone();
-        let mut ranked = Vec::<(usize, u64, f64)>::with_capacity(kids.len());
-        for (mv_u16, c) in kids {
-            let cn = node_at(&arena, c);
-            let v = cn.visits.load(Ordering::Relaxed);
-            let w = cn.win_halves.load(Ordering::Relaxed);
-            let wr = w as f64 / (2.0 * v.max(1) as f64);
-            ranked.push((mv_u16 as usize, v, wr));
-        }
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let tactical_best = if tactical_depth > 0 && tactical_topk > 0 {
-            let k = tactical_topk.min(ranked.len());
-            tactical_pick(&board, &ranked[..k], tactical_depth)
+        let tactical_best = if cfg.tactical_depth > 0 && cfg.tactical_topk > 0 {
+            let k = cfg.tactical_topk.min(tactical_candidates.len());
+            tactical_pick(&board, &tactical_candidates[..k], cfg.tactical_depth)
         } else {
             None
         };
 
-        let chosen_mv = tactical_best.or(best_mv_mcts);
-        let chosen_stats =
-            chosen_mv.and_then(|mv| ranked.iter().find(|(m, _, _)| *m == mv).copied());
+        let chosen_mv = tactical_best.or(snap.best_mv_mcts);
+        maybe_print_debug(
+            cfg,
+            ranked.len(),
+            analysis.root_untried,
+            tactical_best.is_some(),
+            snap.best_mv_mcts.is_some(),
+            snap.total_visits,
+        );
 
-        if let Some((mv, visits, wr)) = chosen_stats {
-            let (x, y) = move_to_xy(mv);
-            println!(
-                "best={} {}, visits={}, winrate={:.4}, elapsed={}s, threads={}, nodes={} (shared tree, unbounded growth)",
-                x,
-                y,
-                visits,
-                wr,
+        if cfg.debug {
+            let dbg_fallback_mv = board.local_moves(cfg.local_radius)[0] as usize;
+            let dbg_mv = chosen_mv.unwrap_or(dbg_fallback_mv);
+            print_search_choice(
+                candidate_for_mv(&ranked, dbg_mv),
                 start.elapsed().as_secs(),
                 threads,
-                node_count
+                snap.node_count,
             );
         }
 
-        if seconds > 0 && start.elapsed().as_secs() >= seconds {
+        if cfg.seconds > 0 && start.elapsed().as_secs() >= cfg.seconds {
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        if seconds > 0
-            && best_visits >= early_stop_min_visits
-            && total_visits > 0
-            && (best_visits as f64 / total_visits as f64) >= early_stop_ratio
+        if cfg.seconds > 0
+            && snap.best_visits >= cfg.early_stop_min_visits
+            && snap.total_visits > 0
+            && (snap.best_visits as f64 / snap.total_visits as f64) >= cfg.early_stop_ratio
         {
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        let done = max_iters
+        let workers_done = cfg
+            .max_iters
             .map(|_| handles.iter().all(|h| h.is_finished()))
             .unwrap_or(false);
-        if done {
+        if workers_done {
             break;
         }
     }
@@ -613,6 +842,28 @@ fn run(args: &[String]) -> i32 {
     for h in handles {
         let _ = h.join();
     }
+
+    let analysis = analyze_root(&arena);
+    let ranked = analysis.ranked;
+    let tactical_candidates = merged_root_candidates(&board, &ranked);
+    let chosen_mv = if cfg.tactical_depth > 0 && cfg.tactical_topk > 0 {
+        let k = cfg.tactical_topk.min(tactical_candidates.len());
+        tactical_pick(&board, &tactical_candidates[..k], cfg.tactical_depth)
+            .or(analysis.snapshot.best_mv_mcts)
+    } else {
+        analysis.snapshot.best_mv_mcts
+    };
+    let fallback_mv = board.local_moves(cfg.local_radius)[0] as usize;
+    let mv = chosen_mv.unwrap_or(fallback_mv);
+    if cfg.debug {
+        print_search_choice(
+            candidate_for_mv(&ranked, mv),
+            start.elapsed().as_secs(),
+            threads,
+            analysis.snapshot.node_count,
+        );
+    }
+    print_move_result(mv);
     0
 }
 
@@ -631,8 +882,13 @@ mod tests {
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
-    fn idx(x: usize, y: usize) -> usize {
-        y * N + x
+    fn test_cfg(max_iters: Option<u64>, local_radius: usize) -> EngineConfig {
+        EngineConfig {
+            local_radius,
+            seconds: 0,
+            max_iters,
+            ..EngineConfig::default()
+        }
     }
 
     #[test]
@@ -642,6 +898,7 @@ mod tests {
         assert_eq!(b.moves_played, 0);
         assert_eq!(b.last, None);
         assert_eq!(b.legal_moves().len(), CELLS);
+        assert_eq!(b.local_moves(2).len(), CELLS);
         assert_eq!(b.terminal(), None);
     }
 
@@ -663,6 +920,41 @@ mod tests {
         let mut b2 = Board::new();
         b2.play(idx(0, 0));
         assert_eq!(opening_move(&b2), None);
+    }
+
+    #[test]
+    fn local_moves_filters_by_radius_and_fallbacks() {
+        let mut b = Board::new();
+        b.play(idx(7, 7));
+        let local = b.local_moves(1);
+        assert!(local.len() < b.legal_moves().len());
+        assert!(local.contains(&(idx(6, 6) as Move)));
+        assert!(!local.contains(&(idx(0, 0) as Move)));
+
+        let all = b.local_moves(0);
+        assert_eq!(all.len(), b.legal_moves().len());
+
+        let mut fallback_board = Board::new();
+        fallback_board.moves_played = 1;
+        let fallback = fallback_board.local_moves(1);
+        assert_eq!(fallback.len(), fallback_board.legal_moves().len());
+    }
+
+    #[test]
+    fn local_moves_invariants() {
+        let mut b = Board::new();
+        b.play(idx(7, 7));
+        b.play(idx(8, 7));
+        let local = b.local_moves(2);
+        let legal = b.legal_moves();
+
+        let local_set: std::collections::HashSet<Move> = local.iter().copied().collect();
+        let legal_set: std::collections::HashSet<Move> = legal.iter().copied().collect();
+        assert_eq!(local_set.len(), local.len());
+        assert!(local_set.is_subset(&legal_set));
+        for mv in &local {
+            assert_eq!(b.cells[*mv as usize], 0);
+        }
     }
 
     #[test]
@@ -806,7 +1098,18 @@ mod tests {
 
         let winning = idx(4, 0);
         let other = idx(7, 7);
-        let candidates = vec![(other, 100, 0.9), (winning, 10, 0.4)];
+        let candidates = vec![
+            Candidate {
+                mv: other,
+                visits: 100,
+                winrate: 0.9,
+            },
+            Candidate {
+                mv: winning,
+                visits: 10,
+                winrate: 0.4,
+            },
+        ];
         assert_eq!(tactical_pick(&b, &candidates, 1), Some(winning));
     }
 
@@ -822,16 +1125,52 @@ mod tests {
 
         let bad = idx(7, 7);
         let block = idx(4, 0);
-        let candidates = vec![(bad, 100, 0.9), (block, 10, 0.4)];
+        let candidates = vec![
+            Candidate {
+                mv: bad,
+                visits: 100,
+                winrate: 0.9,
+            },
+            Candidate {
+                mv: block,
+                visits: 10,
+                winrate: 0.4,
+            },
+        ];
         assert_eq!(tactical_pick(&b, &candidates, 2), Some(block));
     }
 
     #[test]
     fn tactical_pick_none_for_empty_or_zero_depth() {
         let b = Board::new();
-        let candidates = vec![(idx(7, 7), 1, 0.5)];
+        let candidates = vec![Candidate {
+            mv: idx(7, 7),
+            visits: 1,
+            winrate: 0.5,
+        }];
         assert_eq!(tactical_pick(&b, &[], 2), None);
         assert_eq!(tactical_pick(&b, &candidates, 0), None);
+    }
+
+    #[test]
+    fn merged_root_candidates_includes_unexpanded_moves() {
+        let mut b = Board::new();
+        b.play(idx(7, 7));
+        b.play(idx(7, 8));
+        let ranked = vec![Candidate {
+            mv: idx(6, 7),
+            visits: 42,
+            winrate: 0.5,
+        }];
+        let merged = merged_root_candidates(&b, &ranked);
+        assert_eq!(merged.len(), b.legal_moves().len());
+        assert_eq!(merged[0].mv, idx(6, 7));
+        assert_eq!(merged[0].visits, 42);
+
+        let missing_mv = idx(0, 0);
+        let found = merged.iter().find(|c| c.mv == missing_mv).unwrap();
+        assert_eq!(found.visits, 0);
+        assert_eq!(found.winrate, 0.0);
     }
 
     #[test]
@@ -902,18 +1241,18 @@ mod tests {
         b.cells[idx(4, 0)] = BLACK;
         b.last = Some(idx(2, 0));
         let mut rng = Rng::new(1);
-        assert_eq!(rollout(b, &mut rng), BLACK);
+        assert_eq!(rollout(b, &mut rng, 2), BLACK);
     }
 
     #[test]
-    fn best_root_child_skips_zero_visit_children() {
+    fn analyze_root_skips_zero_visit_children_for_best_choice() {
         let root = Node {
             visits: AtomicU64::new(10),
             win_halves: AtomicU64::new(0),
             virtual_loss: AtomicU64::new(0),
             terminal: None,
             untried: Mutex::new(Vec::new()),
-            children: Mutex::new(vec![(idx(0, 0) as u16, 1), (idx(1, 1) as u16, 2)]),
+            children: Mutex::new(vec![(idx(0, 0) as Move, 1), (idx(1, 1) as Move, 2)]),
         };
         let child_a = Node {
             visits: AtomicU64::new(0),
@@ -936,11 +1275,16 @@ mod tests {
             Arc::new(child_a),
             Arc::new(child_b),
         ]));
-        let (best_mv, best_visits, best_wr, node_count, _total_visits) = best_root_child(&arena);
-        assert_eq!(best_mv, Some(idx(1, 1)));
-        assert_eq!(best_visits, 4);
-        assert_eq!(best_wr, 0.75);
-        assert_eq!(node_count, 3);
+        let analysis = analyze_root(&arena);
+        assert_eq!(analysis.snapshot.best_mv_mcts, Some(idx(1, 1)));
+        assert_eq!(analysis.snapshot.best_visits, 4);
+        assert_eq!(analysis.snapshot.node_count, 3);
+        assert_eq!(analysis.snapshot.total_visits, 10);
+        assert_eq!(analysis.ranked.len(), 2);
+        let best = analysis.ranked.first().unwrap();
+        assert_eq!(best.mv, idx(1, 1));
+        assert_eq!(best.visits, 4);
+        assert_eq!(best.winrate, 0.75);
     }
 
     #[test]
@@ -964,7 +1308,7 @@ mod tests {
             stop,
             arena.clone(),
             tt,
-            Some(100),
+            test_cfg(Some(100), 2),
         );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
@@ -991,7 +1335,7 @@ mod tests {
             stop,
             arena.clone(),
             tt,
-            Some(0),
+            test_cfg(Some(0), 2),
         );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
@@ -1018,7 +1362,7 @@ mod tests {
             stop,
             arena.clone(),
             tt,
-            Some(2),
+            test_cfg(Some(2), 2),
         );
         let root_node = node_at(&arena, 0);
         assert!(root_node.visits.load(Ordering::Relaxed) >= 2);
@@ -1039,7 +1383,15 @@ mod tests {
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(2, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
+        worker(
+            2,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 1);
         assert_eq!(root_node.win_halves.load(Ordering::Relaxed), 2);
@@ -1059,13 +1411,21 @@ mod tests {
             win_halves: AtomicU64::new(0),
             virtual_loss: AtomicU64::new(0),
             terminal: None,
-            untried: Mutex::new(vec![idx(4, 0) as u16]),
+            untried: Mutex::new(vec![idx(4, 0) as Move]),
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(3, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
+        worker(
+            3,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
         assert!(arena.lock().unwrap().len() >= 2);
     }
 
@@ -1078,7 +1438,7 @@ mod tests {
             virtual_loss: AtomicU64::new(0),
             terminal: None,
             untried: Mutex::new(Vec::new()),
-            children: Mutex::new(vec![(idx(0, 0) as u16, 1)]),
+            children: Mutex::new(vec![(idx(0, 0) as Move, 1)]),
         };
         let child = Node {
             visits: AtomicU64::new(1),
@@ -1094,7 +1454,15 @@ mod tests {
         b2.play(idx(0, 0));
         tt.insert(b2.tt_key(), 1usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(4, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
+        worker(
+            4,
+            board.clone(),
+            BLACK,
+            stop,
+            arena.clone(),
+            tt,
+            test_cfg(Some(1), 2),
+        );
 
         let root_node = node_at(&arena, 0);
         let child_node = node_at(&arena, 1);
@@ -1124,7 +1492,7 @@ mod tests {
             stop,
             arena.clone(),
             tt,
-            Some(1),
+            test_cfg(Some(1), 2),
         );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 1);
@@ -1138,7 +1506,7 @@ mod tests {
             win_halves: AtomicU64::new(0),
             virtual_loss: AtomicU64::new(0),
             terminal: None,
-            untried: Mutex::new(vec![idx(0, 0) as u16]),
+            untried: Mutex::new(vec![idx(0, 0) as Move]),
             children: Mutex::new(Vec::new()),
         };
 
@@ -1165,21 +1533,21 @@ mod tests {
             stop,
             arena.clone(),
             tt,
-            Some(1),
+            test_cfg(Some(1), 2),
         );
 
         let root_node = node_at(&arena, 0);
         let kids = root_node.children.lock().unwrap().clone();
         assert_eq!(kids.len(), 1);
-        assert_eq!(kids[0], (idx(0, 0) as u16, 1usize));
+        assert_eq!(kids[0], (idx(0, 0) as Move, 1usize));
         assert_eq!(arena.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn run_handles_invalid_and_terminal_args() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "0");
-        env::set_var("MCTS_ITERS", "1");
+        env::set_var(ENV_SECONDS, "0");
+        env::set_var(ENV_ITERS, "1");
         assert_eq!(run(&["15,0".to_string()]), 1);
 
         let mut moves = Vec::new();
@@ -1190,95 +1558,141 @@ mod tests {
             }
         }
         assert_eq!(run(&moves), 1);
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
     }
 
     #[test]
     fn run_executes_with_iteration_cap() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("MCTS_SECONDS");
-        env::set_var("MCTS_ITERS", "1");
+        env::remove_var(ENV_SECONDS);
+        env::set_var(ENV_ITERS, "1");
         let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_ITERS);
     }
 
     #[test]
     fn run_executes_with_zero_iteration_cap() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("MCTS_SECONDS");
-        env::set_var("MCTS_ITERS", "0");
+        env::set_var(ENV_SECONDS, "0");
+        env::set_var(ENV_ITERS, "0");
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
     }
 
     #[test]
     fn run_executes_with_seconds_cap() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "1");
-        env::remove_var("MCTS_ITERS");
+        env::set_var(ENV_SECONDS, "1");
+        env::remove_var(ENV_ITERS);
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_SECONDS");
+        env::remove_var(ENV_SECONDS);
     }
 
     #[test]
     fn run_executes_with_seconds_before_iteration_cap() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "1");
-        env::set_var("MCTS_ITERS", "1000000");
+        env::set_var(ENV_SECONDS, "1");
+        env::set_var(ENV_ITERS, "1000000");
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
     }
 
     #[test]
     fn run_executes_done_false_path_before_seconds_break() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "2");
-        env::set_var("MCTS_ITERS", "1000000000");
+        env::set_var(ENV_SECONDS, "2");
+        env::set_var(ENV_ITERS, "1000000000");
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
     }
 
     #[test]
     fn run_executes_early_stop_with_custom_thresholds() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "60");
-        env::set_var("MCTS_EARLY_STOP_RATIO", "0.0");
-        env::set_var("MCTS_EARLY_STOP_MIN_VISITS", "0");
-        env::remove_var("MCTS_ITERS");
+        env::set_var(ENV_SECONDS, "60");
+        env::set_var(ENV_EARLY_STOP_RATIO, "0.0");
+        env::set_var(ENV_EARLY_STOP_MIN_VISITS, "0");
+        env::remove_var(ENV_ITERS);
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_EARLY_STOP_RATIO");
-        env::remove_var("MCTS_EARLY_STOP_MIN_VISITS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_EARLY_STOP_RATIO);
+        env::remove_var(ENV_EARLY_STOP_MIN_VISITS);
     }
 
     #[test]
     fn run_executes_with_tactical_disabled() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("MCTS_SECONDS", "1");
-        env::set_var("MCTS_TACTICAL_DEPTH", "0");
-        env::set_var("MCTS_TACTICAL_TOPK", "0");
-        env::remove_var("MCTS_ITERS");
+        env::set_var(ENV_SECONDS, "1");
+        env::set_var(ENV_TACTICAL_DEPTH, "0");
+        env::set_var(ENV_TACTICAL_TOPK, "0");
+        env::remove_var(ENV_ITERS);
         let args = vec!["7,7".to_string()];
         assert_eq!(run(&args), 0);
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_TACTICAL_DEPTH");
-        env::remove_var("MCTS_TACTICAL_TOPK");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_TACTICAL_DEPTH);
+        env::remove_var(ENV_TACTICAL_TOPK);
+    }
+
+    #[test]
+    fn run_executes_with_debug_logging_enabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var(ENV_SECONDS, "1");
+        env::set_var(ENV_DEBUG, "1");
+        env::remove_var(ENV_ITERS);
+        let args = vec!["7,7".to_string()];
+        assert_eq!(run(&args), 0);
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_DEBUG);
+    }
+
+    #[test]
+    fn run_executes_with_invalid_local_radius_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var(ENV_SECONDS, "1");
+        env::set_var(ENV_LOCAL_RADIUS, "nope");
+        env::remove_var(ENV_ITERS);
+        let args = vec!["7,7".to_string()];
+        assert_eq!(run(&args), 0);
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_LOCAL_RADIUS);
+    }
+
+    #[test]
+    fn engine_config_parses_seed_and_invalid_seed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var(ENV_SEED, "123");
+        assert_eq!(EngineConfig::from_env().seed_base, Some(123));
+        env::set_var(ENV_SEED, "nope");
+        assert_eq!(EngineConfig::from_env().seed_base, None);
+        env::remove_var(ENV_SEED);
     }
 
     #[test]
     fn run_executes_opening_center_path() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("MCTS_SECONDS");
-        env::remove_var("MCTS_ITERS");
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
+        env::set_var(ENV_DEBUG, "1");
+        assert_eq!(run(&[]), 0);
+        env::remove_var(ENV_DEBUG);
+    }
+
+    #[test]
+    fn run_executes_opening_center_path_without_debug() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
+        env::remove_var(ENV_DEBUG);
         assert_eq!(run(&[]), 0);
     }
 }

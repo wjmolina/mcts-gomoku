@@ -171,13 +171,11 @@ async function connectAndJoin() {
 async function play(x, y) {
   thinking = true;
   hover = null;
-  c.style.cursor = 'progress';
   draw();
   try {
     state = await postJson('/play', { player_id: playerId, x, y });
   } finally {
     thinking = false;
-    c.style.cursor = 'default';
     draw();
   }
 }

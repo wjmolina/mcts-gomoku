@@ -31,6 +31,15 @@ def get(path: str):
 def parse_best_move(stdout: str):
     best = None
     for line in stdout.splitlines():
+        line = line.strip()
+        if "," in line and not line.startswith("best="):
+            parts = line.split(",")
+            if len(parts) == 2:
+                try:
+                    best = (int(parts[0]), int(parts[1]))
+                    continue
+                except ValueError:
+                    pass
         if line.startswith("best="):
             left = line.split(",", 1)[0]
             parts = left.replace("best=", "").split()
@@ -47,6 +56,10 @@ def think(moves: list[list[int]]):
     env = os.environ.copy()
     env["MCTS_SECONDS"] = str(ENGINE_SECONDS)
     p = subprocess.run([ENGINE_BIN, *args], text=True, capture_output=True, env=env, timeout=max(ENGINE_SECONDS + 10, 15))
+    if p.stdout:
+        print(p.stdout, end="")
+    if p.stderr:
+        print(p.stderr, end="")
     if p.returncode != 0:
         raise RuntimeError((p.stderr or "engine failed").strip())
     mv = parse_best_move(p.stdout)
@@ -58,7 +71,6 @@ def think(moves: list[list[int]]):
 def main():
     pid = post("/connect", {})["player_id"]
     st = post("/join", {"player_id": pid})
-    print(f"ai client connected: player_id={pid}")
 
     while True:
         if st.get("status") != "matched":
