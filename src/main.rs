@@ -363,11 +363,7 @@ fn parse_move(s: &str) -> Option<usize> {
     let (a, b) = s.split_once(',')?;
     let x: usize = a.parse().ok()?;
     let y: usize = b.parse().ok()?;
-    if x < N && y < N {
-        Some(y * N + x)
-    } else {
-        None
-    }
+    if x < N && y < N { Some(idx(x, y)) } else { None }
 }
 
 fn move_to_xy(mv: usize) -> (usize, usize) {
@@ -1355,26 +1351,8 @@ mod tests {
 
     #[test]
     fn arena_helpers_and_evaluate() {
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(vec![0]),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
-        let child_idx = add_child(
-            &arena,
-            Node {
-                visits: AtomicU64::new(0),
-                win_halves: AtomicU64::new(0),
-                virtual_loss: AtomicU64::new(0),
-                terminal: Some(BLACK),
-                untried: Mutex::new(Vec::new()),
-                children: Mutex::new(Vec::new()),
-            },
-        );
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_node(None, vec![0]))]));
+        let child_idx = add_child(&arena, make_node(Some(BLACK), vec![]));
         assert_eq!(child_idx, 1);
         let _n = node_at(&arena, 1);
 
@@ -1473,14 +1451,7 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(vec![(idx(0, 0) as Move, 1), (idx(1, 1) as Move, 2)]),
         };
-        let child_a = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
+        let child_a = make_node(None, vec![]);
         let child_b = Node {
             visits: AtomicU64::new(4),
             win_halves: AtomicU64::new(6),
@@ -1509,15 +1480,7 @@ mod tests {
     #[test]
     fn worker_stops_immediately_when_flag_set() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: board.terminal(),
-            untried: Mutex::new(board.legal_moves()),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(100), 2)))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(true));
         worker(
@@ -1536,15 +1499,7 @@ mod tests {
     #[test]
     fn worker_respects_zero_iteration_limit() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: board.terminal(),
-            untried: Mutex::new(board.legal_moves()),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(0), 2)))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1563,15 +1518,7 @@ mod tests {
     #[test]
     fn worker_runs_with_iteration_limit() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: board.terminal(),
-            untried: Mutex::new(board.legal_moves()),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(2), 2)))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1591,15 +1538,7 @@ mod tests {
     #[test]
     fn worker_root_terminal_branch() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: Some(BLACK),
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_node(Some(BLACK), vec![]))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1625,15 +1564,7 @@ mod tests {
         board.side = BLACK;
         board.moves_played = 4;
         board.last = Some(idx(3, 0));
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(vec![idx(4, 0) as Move]),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_node(None, vec![idx(4, 0) as Move]))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1693,15 +1624,7 @@ mod tests {
     #[test]
     fn worker_dead_end_rollout_branch() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_node(None, vec![]))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(
@@ -1720,27 +1643,12 @@ mod tests {
     #[test]
     fn worker_expansion_uses_tt_cache_hit() {
         let board = Board::new();
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(vec![idx(0, 0) as Move]),
-            children: Mutex::new(Vec::new()),
-        };
-
         let mut child_board = board.clone();
         child_board.play(idx(0, 0));
-        let child = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: child_board.terminal(),
-            untried: Mutex::new(child_board.legal_moves()),
-            children: Mutex::new(Vec::new()),
-        };
-
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root), Arc::new(child)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![
+            Arc::new(make_node(None, vec![idx(0, 0) as Move])),
+            Arc::new(make_node(child_board.terminal(), child_board.legal_moves())),
+        ]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         tt.insert(child_board.tt_key(), 1usize);
 
@@ -2005,18 +1913,10 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(vec![(mv2, 2)]),
         };
-        let child2 = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: Some(BLACK),
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
         let arena: Arena = Arc::new(RwLock::new(vec![
             Arc::new(root),
             Arc::new(child1),
-            Arc::new(child2),
+            Arc::new(make_node(Some(BLACK), vec![])),
         ]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
@@ -2071,18 +1971,10 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(vec![(mv2, 2)]),
         };
-        let child2 = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: Some(WHITE),
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
         let arena: Arena = Arc::new(RwLock::new(vec![
             Arc::new(root),
             Arc::new(child1),
-            Arc::new(child2),
+            Arc::new(make_node(Some(WHITE), vec![])),
         ]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
@@ -2135,19 +2027,11 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(vec![(mv2, 2)]),
         };
-        // Draw terminal at depth 2 (chosen by opponent).
-        let child2 = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: Some(0),
-            untried: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
-        };
         let arena: Arena = Arc::new(RwLock::new(vec![
             Arc::new(root),
             Arc::new(child1),
-            Arc::new(child2),
+            // Draw terminal at depth 2 (chosen by opponent).
+            Arc::new(make_node(Some(0), vec![])),
         ]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
@@ -2175,24 +2059,11 @@ mod tests {
         let board = Board::new();
         let mv1 = idx(3, 3) as Move;
         let mv2 = idx(4, 4) as Move;
-        let root = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(vec![mv1, mv2]),
-            children: Mutex::new(Vec::new()),
-        };
         // The single shared child that both moves will resolve to via the TT.
-        let shared_child = Node {
-            visits: AtomicU64::new(0),
-            win_halves: AtomicU64::new(0),
-            virtual_loss: AtomicU64::new(0),
-            terminal: None,
-            untried: Mutex::new(board.local_moves(2)),
-            children: Mutex::new(Vec::new()),
-        };
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root), Arc::new(shared_child)]));
+        let arena: Arena = Arc::new(RwLock::new(vec![
+            Arc::new(make_node(None, vec![mv1, mv2])),
+            Arc::new(make_node(None, board.local_moves(2))),
+        ]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         // Force both move-boards to resolve to node 1 in the TT.
         let mut b1 = board.clone();
