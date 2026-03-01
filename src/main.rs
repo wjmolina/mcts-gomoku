@@ -436,12 +436,17 @@ fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
 /// Heuristic threat score for `player`.
 /// Scans every 5-cell window in all four directions. Windows that contain no
 /// opponent stones are scored by how many player stones they already hold.
-/// This naturally handles broken/split patterns (e.g. XX_XX scores like a
-/// half-open four because it contributes one k=4 window).
+/// Handles broken/split patterns naturally (XX_XX = one k=4 window = 1 000).
+/// A non-linear fork bonus rewards threats in multiple directions simultaneously:
+///   two fours   → +50 000   (double-four: unblockable)
+///   four + three → +10 000  (four-three fork: very strong)
+///   two threes  → +5 000    (double-three: usually unblockable)
 fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
     let opp = if player == BLACK { WHITE } else { BLACK };
     let mut score = 0i32;
-    for &(dx, dy) in &DIRS {
+    let mut four_dirs = [false; 4];
+    let mut three_dirs = [false; 4];
+    for (d, &(dx, dy)) in DIRS.iter().enumerate() {
         for sy in 0..N as isize {
             for sx in 0..N as isize {
                 // Skip if the 5-cell window doesn't fit on the board.
@@ -462,6 +467,12 @@ fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
                 if has_opp {
                     continue;
                 }
+                if p_count == 4 {
+                    four_dirs[d] = true;
+                }
+                if p_count == 3 {
+                    three_dirs[d] = true;
+                }
                 score += match p_count {
                     4 => 1_000,
                     3 => 100,
@@ -472,6 +483,14 @@ fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
             }
         }
     }
+    let n_four = four_dirs.iter().filter(|&&x| x).count();
+    let n_three = three_dirs.iter().filter(|&&x| x).count();
+    score += match (n_four, n_three) {
+        (f, _) if f >= 2 => 50_000,
+        (1, t) if t >= 1 => 10_000,
+        (_, t) if t >= 2 => 5_000,
+        _ => 0,
+    };
     score
 }
 
@@ -1412,6 +1431,40 @@ mod tests {
         let mut cw = [0u8; CELLS];
         for x in 1..5 { cw[idx(x, 0)] = WHITE; }
         assert_eq!(evaluate(&cw), WHITE);
+    }
+
+    #[test]
+    fn threat_score_fork_bonus() {
+        // arm 1 (f >= 2 → +50_000): fours in two directions sharing a corner stone.
+        let mut c_df = [0u8; CELLS];
+        for x in 0..4 { c_df[idx(x, 0)] = BLACK; } // horizontal four
+        for y in 1..4 { c_df[idx(0, y)] = BLACK; } // vertical four (shares (0,0))
+        assert!(threat_score(&c_df, BLACK) >= 50_000, "double four: two directions");
+
+        // arm 2 guard true (n_four=1, n_three>=1 → +10_000):
+        // an open four's overlapping k=3 tail window sets three_dirs too.
+        let mut c_ft = [0u8; CELLS];
+        for x in 1..5 { c_ft[idx(x, 0)] = BLACK; }
+        assert!(threat_score(&c_ft, BLACK) >= 10_000, "four+three bonus from open four");
+
+        // arm 2 guard false (n_four=1, n_three=0): right end blocked by opponent,
+        // only one window passes and it has k=4 — no k=3 tail windows survive.
+        // Falls through arm-2 guard and arm-3 guard to arm 4 → 0 fork bonus.
+        let mut c_hf = [0u8; CELLS];
+        for x in 1..5 { c_hf[idx(x, 0)] = BLACK; }
+        c_hf[idx(5, 0)] = WHITE;
+        assert!(threat_score(&c_hf, BLACK) < 10_000, "right-blocked four: no fork bonus");
+
+        // arm 3 (n_four=0, n_three>=2 → +5_000): threes in two directions, no fours.
+        let mut c_dt = [0u8; CELLS];
+        for x in 1..4 { c_dt[idx(x, 5)] = BLACK; } // horizontal three
+        for y in 1..4 { c_dt[idx(7, y)] = BLACK; } // vertical three
+        assert!(threat_score(&c_dt, BLACK) >= 5_000, "double three in two directions");
+
+        // arm 4 (_ => 0): single stone, n_four=0, n_three=0 → no fork bonus.
+        let mut c_one = [0u8; CELLS];
+        c_one[idx(7, 7)] = BLACK;
+        assert!(threat_score(&c_one, BLACK) < 5_000, "single stone: no fork bonus");
     }
 
     #[test]
