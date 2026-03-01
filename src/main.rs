@@ -290,6 +290,52 @@ fn best_root_child(arena: &Arena) -> (Option<usize>, u64, f64, usize, u64) {
     (best_mv, best_visits, best_wr, node_count, total_visits)
 }
 
+fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8) -> i8 {
+    if let Some(t) = board.terminal() {
+        return if t == 0 { 0 } else { -1 };
+    }
+    if depth == 0 {
+        return 0;
+    }
+
+    let mut best = -1i8;
+    for mv in board.legal_moves() {
+        let mut b2 = board.clone();
+        b2.play(mv as usize);
+        let score = -alpha_beta(&b2, depth - 1, -beta, -alpha);
+        if score > best {
+            best = score;
+        }
+        if best > alpha {
+            alpha = best;
+        }
+        if alpha >= beta {
+            break;
+        }
+    }
+    best
+}
+
+fn tactical_pick(board: &Board, candidates: &[(usize, u64, f64)], depth: usize) -> Option<usize> {
+    if depth == 0 || candidates.is_empty() {
+        return None;
+    }
+
+    let mut first_non_losing = None::<usize>;
+    for &(mv, _, _) in candidates {
+        let mut b2 = board.clone();
+        b2.play(mv);
+        let score_for_root = -alpha_beta(&b2, depth.saturating_sub(1), -1, 1);
+        if score_for_root == 1 {
+            return Some(mv);
+        }
+        if score_for_root >= 0 && first_non_losing.is_none() {
+            first_non_losing = Some(mv);
+        }
+    }
+    first_non_losing
+}
+
 fn worker(
     id: usize,
     root: Board,
@@ -461,6 +507,14 @@ fn run(args: &[String]) -> i32 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(10_000);
+    let tactical_depth = env::var("MCTS_TACTICAL_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2);
+    let tactical_topk = env::var("MCTS_TACTICAL_TOPK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
 
     let mut handles = Vec::with_capacity(threads);
     for i in 0..threads {
@@ -478,16 +532,40 @@ fn run(args: &[String]) -> i32 {
     loop {
         thread::sleep(Duration::from_secs(1));
 
-        let (best_mv, best_visits, best_wr, node_count, total_visits) = best_root_child(&arena);
+        let (best_mv_mcts, best_visits, _best_wr_mcts, node_count, total_visits) =
+            best_root_child(&arena);
 
-        if let Some(mv) = best_mv {
+        let root_node = node_at(&arena, 0);
+        let kids = root_node.children.lock().unwrap().clone();
+        let mut ranked = Vec::<(usize, u64, f64)>::with_capacity(kids.len());
+        for (mv_u16, c) in kids {
+            let cn = node_at(&arena, c);
+            let v = cn.visits.load(Ordering::Relaxed);
+            let w = cn.win_halves.load(Ordering::Relaxed);
+            let wr = w as f64 / (2.0 * v.max(1) as f64);
+            ranked.push((mv_u16 as usize, v, wr));
+        }
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let tactical_best = if tactical_depth > 0 && tactical_topk > 0 {
+            let k = tactical_topk.min(ranked.len());
+            tactical_pick(&board, &ranked[..k], tactical_depth)
+        } else {
+            None
+        };
+
+        let chosen_mv = tactical_best.or(best_mv_mcts);
+        let chosen_stats =
+            chosen_mv.and_then(|mv| ranked.iter().find(|(m, _, _)| *m == mv).copied());
+
+        if let Some((mv, visits, wr)) = chosen_stats {
             let (x, y) = move_to_xy(mv);
             println!(
                 "best={} {}, visits={}, winrate={:.4}, elapsed={}s, threads={}, nodes={} (shared tree, unbounded growth)",
                 x,
                 y,
-                best_visits,
-                best_wr,
+                visits,
+                wr,
                 start.elapsed().as_secs(),
                 threads,
                 node_count
@@ -674,6 +752,78 @@ mod tests {
         b2.last = b1.last.map(|c| transform_index(1, c));
 
         assert_eq!(b1.tt_key(), b2.tt_key());
+    }
+
+    #[test]
+    fn alpha_beta_detects_immediate_win() {
+        let mut b = Board::new();
+        for x in 0..4 {
+            b.cells[idx(x, 0)] = BLACK;
+        }
+        b.side = BLACK;
+        b.moves_played = 4;
+        b.last = Some(idx(3, 0));
+        assert_eq!(alpha_beta(&b, 1, -1, 1), 1);
+    }
+
+    #[test]
+    fn tactical_pick_prefers_forced_win() {
+        let mut b = Board::new();
+        for x in 0..4 {
+            b.cells[idx(x, 0)] = BLACK;
+        }
+        b.side = BLACK;
+        b.moves_played = 4;
+        b.last = Some(idx(3, 0));
+
+        let winning = idx(4, 0);
+        let other = idx(7, 7);
+        let candidates = vec![(other, 100, 0.9), (winning, 10, 0.4)];
+        assert_eq!(tactical_pick(&b, &candidates, 1), Some(winning));
+    }
+
+    #[test]
+    fn tactical_pick_avoids_forced_loss_when_block_exists() {
+        let mut b = Board::new();
+        for x in 0..4 {
+            b.cells[idx(x, 0)] = WHITE;
+        }
+        b.side = BLACK;
+        b.moves_played = 4;
+        b.last = Some(idx(3, 0));
+
+        let bad = idx(7, 7);
+        let block = idx(4, 0);
+        let candidates = vec![(bad, 100, 0.9), (block, 10, 0.4)];
+        assert_eq!(tactical_pick(&b, &candidates, 2), Some(block));
+    }
+
+    #[test]
+    fn tactical_pick_none_for_empty_or_zero_depth() {
+        let b = Board::new();
+        let candidates = vec![(idx(7, 7), 1, 0.5)];
+        assert_eq!(tactical_pick(&b, &[], 2), None);
+        assert_eq!(tactical_pick(&b, &candidates, 0), None);
+    }
+
+    #[test]
+    fn alpha_beta_terminal_and_depth_zero_paths() {
+        let mut term = Board::new();
+        for x in 0..5 {
+            term.cells[idx(x, 0)] = BLACK;
+        }
+        term.side = WHITE;
+        term.moves_played = 5;
+        term.last = Some(idx(4, 0));
+        assert_eq!(alpha_beta(&term, 3, -1, 1), -1);
+
+        let b = Board::new();
+        assert_eq!(alpha_beta(&b, 0, -1, 1), 0);
+
+        let mut draw = Board::new();
+        draw.moves_played = CELLS;
+        draw.last = None;
+        assert_eq!(alpha_beta(&draw, 3, -1, 1), 0);
     }
 
     #[test]
@@ -1080,5 +1230,19 @@ mod tests {
         env::remove_var("MCTS_SECONDS");
         env::remove_var("MCTS_EARLY_STOP_RATIO");
         env::remove_var("MCTS_EARLY_STOP_MIN_VISITS");
+    }
+
+    #[test]
+    fn run_executes_with_tactical_disabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var("MCTS_SECONDS", "1");
+        env::set_var("MCTS_TACTICAL_DEPTH", "0");
+        env::set_var("MCTS_TACTICAL_TOPK", "0");
+        env::remove_var("MCTS_ITERS");
+        let args = vec!["7,7".to_string()];
+        assert_eq!(run(&args), 0);
+        env::remove_var("MCTS_SECONDS");
+        env::remove_var("MCTS_TACTICAL_DEPTH");
+        env::remove_var("MCTS_TACTICAL_TOPK");
     }
 }
