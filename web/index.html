@@ -58,6 +58,7 @@ let state = null;
 let playerId = localStorage.getItem('player_id') || null;
 let thinking = false;
 let hover = null;
+let lastMouse = null;
 let size = 0, step = 0, lineW = 0, stoneR = 0, start = 0;
 let restartHot = false, restartDown = false;
 let pollTimer = null;
@@ -196,13 +197,22 @@ function draw() {
   drawBoard();
   if (!state || state.status !== 'matched') {
     c.style.cursor = 'default';
+    hover = null;
     return;
   }
 
   const myTurn = state.side === state.turn;
-  c.style.cursor = (!state.over && !thinking && myTurn) ? 'pointer' : 'default';
+  const canHover = !state.over && !thinking && myTurn;
+  c.style.cursor = canHover ? 'pointer' : 'default';
 
-  if (!state.over && !thinking && myTurn && hover && state.board[idx(hover.x, hover.y)] === E) {
+  if (canHover && lastMouse) {
+    const q = pick(lastMouse.mx, lastMouse.my);
+    hover = q && state.board[idx(q.x, q.y)] === E ? q : null;
+  } else {
+    hover = null;
+  }
+
+  if (canHover && hover && state.board[idx(hover.x, hover.y)] === E) {
     drawMarker(p(hover.x), p(hover.y), '#ffd84d');
   }
 
@@ -318,11 +328,12 @@ c.addEventListener('click', async e => {
 });
 
 c.addEventListener('mousemove', e => {
+  lastMouse = mousePos(e);
   if (!state || state.status !== 'matched' || state.over || thinking || state.turn !== state.side) {
     if (hover) { hover = null; draw(); }
     return;
   }
-  const { mx, my } = mousePos(e);
+  const { mx, my } = lastMouse;
   const q = pick(mx, my);
   const next = q && state.board[idx(q.x, q.y)] === E ? q : null;
   if ((hover?.x ?? -1) !== (next?.x ?? -1) || (hover?.y ?? -1) !== (next?.y ?? -1)) {
@@ -331,7 +342,10 @@ c.addEventListener('mousemove', e => {
   }
 });
 
-c.addEventListener('mouseleave', () => { if (hover) { hover = null; draw(); } });
+c.addEventListener('mouseleave', () => {
+  lastMouse = null;
+  if (hover) { hover = null; draw(); }
+});
 restart.addEventListener('mousemove', e => {
   restartHot = restartHit(e);
   restart.classList.toggle('hot', restartHot);
