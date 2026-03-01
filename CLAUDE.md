@@ -1,136 +1,93 @@
-# mcts-gomoku Project Log
+# mcts-gomoku
 
-This file summarizes what was implemented during this project across engine, frontend, backend, testing, and EC2 runtime/deployment operations.
+## What this is
 
-## 1) Core Goal
+A from-scratch MCTS Gomoku engine for a 15×15 board (5-in-a-row, free play). Written in Rust with zero external dependencies. Includes a training-free engine, a matchmaking server, and a browser UI.
 
-Build an intentionally minimal Rust MCTS Gomoku (15x15, 5-in-a-row) engine, then add enough surrounding tooling/UI to:
-- play vs engine locally,
-- run matches/experiments,
-- expose play over HTTP with persistent game state,
-- and deploy/run on EC2.
+## Files
 
-## 2) Engine (Rust, `src/main.rs`)
+- `src/main.rs` - everything: MCTS, tactical alpha-beta, board, CLI entry point
+- `tests/cli.rs` - integration tests: spawn the binary, check exit code and output
+- `web/index.html` - browser UI
+- `web/server.py` - stdlib HTTP server; manages player sessions, matchmaking queue, and game state
+- `web/ai_client.py` - bot player; joins the queue like any other player and calls the engine for moves
+- `Cargo.toml` - no external dependencies
 
-### Initial direction
-- Built a single-file engine (`src/main.rs`) per request (no multi-file split).
-- Used MCTS with:
-  - UCT selection,
-  - expansion,
-  - rollout,
-  - backpropagation.
-- Shared tree across threads (single arena + synchronized node structures).
-- Added transposition table support and canonical hashing under board symmetries.
+## Commands
 
-### Parallelism and resource usage
-- Engine uses `available_parallelism()` for worker thread count.
-- Shared arena + atomics + mutex-protected child/untried vectors.
-- Virtual loss added in selection to reduce thread collisions.
+Build:
 
-### Hyperparameters/env configs
-- `MCTS_LOCAL_RADIUS` (default: 2)
-- `MCTS_SECONDS` (default: 1)
-- `MCTS_ITERS` (default: unset)
-- `MCTS_SEED` (default: unset)
-- `MCTS_EARLY_STOP_RATIO` (default: 0.99)
-- `MCTS_EARLY_STOP_MIN_VISITS` (default: 10000)
-- `MCTS_TACTICAL_DEPTH` (default: 2)
-- `MCTS_TACTICAL_TOPK` (default: 225)
-- `MCTS_DEBUG` (default: off; set to `1` to enable)
+```
+cargo build --release
+```
 
-### Tactical layer
-- Shallow alpha-beta tactical pass at root (depth/top-k configurable).
-- Tactical can override pure MCTS root choice.
-- Merges candidates from all legal root moves (not just expanded children) to avoid missing critical moves.
+Test (55 unit + 2 integration, 100% coverage via `cargo llvm-cov`):
 
-### Output/logging
-- Engine prints minimal final move as `x,y`.
-- Verbose debug output gated behind `MCTS_DEBUG=1`.
+```
+cargo test
+cargo llvm-cov
+```
 
-## 3) DRY/minimality refactors (engine)
+Run UI (two terminals):
 
-Multiple rounds of DRY audit across 5 commits (`b408628` → `347a2d5`):
-- `make_node()` / `make_root_node()` — canonical Node constructor
-- `zero_candidate()` — canonical zero-visit Candidate constructor
-- `resolve_mv()` — fallback move unwrap helper
-- `opp()` — opponent color helper (eliminated 3 inline expressions)
-- `Board::on_board` used consistently in `wins_at`
-- `idx()` used consistently in `parse_move` and `transform_index`
-- Tests: `make_root_node` replaces manual `Node{...}` literals; `let cfg` deduplicated in worker tests
+```
+python3 web/server.py
+python3 web/ai_client.py
+```
 
-## 4) Tests and Coverage
+## Engine protocol
 
-- 57 tests total (55 unit + 2 CLI integration in `tests/cli.rs`).
-- Coverage: **100% regions / 100% functions / 100% lines** (verified via `cargo llvm-cov`).
-- Tests cover: board rules, win detection, parsing, worker branches, rollout/selection/backprop, tactical selection, run loop stop conditions, env parsing, transposition/symmetry hashing, root candidate merge.
+Input: move history as positional args, each `x,y` (0-indexed, column,row).
 
-## 5) Backend/Service (`web/server.py`, `web/ai_client.py`)
+```
+./target/release/mcts-gomoku 7,7 7,8 6,7
+```
 
-### Server
-- Minimal HTTP server for game lifecycle and stateful play.
-- Supports connect/join/state/play/restart flow and queue-based pairing.
-- Added `/restart` endpoint: tears down current game, re-queues both players.
-- Fixed `GAMES.get()` guard in `player_state` for missing game robustness.
-- Maintains game state server-side (frontend stays thin).
-- Serves `web/index.html`.
+Output: one line on stdout, `x,y` — the chosen move.
 
-### AI client bridge
-- `web/ai_client.py` polls server and plays as one queued participant.
-- Invokes engine binary each AI turn with move history args.
-- Uses environment-configured think time (`ENGINE_SECONDS`, default 60).
-- Parses both legacy `best=...` lines and new minimal `x,y` output.
-- Emits captured engine stdout/stderr into `ai.log`.
+Exit code 0 on success, non-zero on invalid input (out-of-bounds move, already-terminal position).
 
-## 6) Frontend (`web/index.html`)
+## Engine env vars
 
-- Centered board layout, responsive sizing, wood theme.
-- Hover marker, last-move indicator, win marking.
-- Restart button tile: mini board-cell canvas positioned top-left of board.
-  - Hot/down visual states, hit-test via fractional bounds.
-  - Calls `/restart` endpoint; re-queues player without full reconnect.
-- `lastMouse` tracked to recompute hover correctly on state change.
-- `restartSize()` / `redrawRestart()` helpers to avoid repeated `getBoundingClientRect` calls.
-- `mousePos()` result destructured explicitly instead of spread trick.
+| var | default | meaning |
+| --- | --- | --- |
+| `MCTS_SECONDS` | 1 | think time per move |
+| `MCTS_ITERS` | unset | iteration cap (overrides time if set) |
+| `MCTS_LOCAL_RADIUS` | 2 | only consider moves within N cells of existing stones |
+| `MCTS_EARLY_STOP_RATIO` | 0.99 | stop early if best child has this fraction of root visits |
+| `MCTS_EARLY_STOP_MIN_VISITS` | 10000 | minimum root visits before early stop applies |
+| `MCTS_TACTICAL_DEPTH` | 2 | alpha-beta depth for tactical pre-search |
+| `MCTS_TACTICAL_TOPK` | 225 | candidate moves considered in tactical search |
+| `MCTS_SEED` | unset | RNG seed for reproducibility |
+| `MCTS_DEBUG` | unset | set to `1` for verbose stdout output |
 
-## 7) EC2 operations
+## AI client env vars
 
-- `ssh -i /tmp/wmolina-tmp.pem ec2-user@54.235.29.11`
-- Project path on EC2: `/home/ec2-user/mcts`
-- Synced via `rsync`, built release binary, started/restarted `server.py` and `ai.py`.
-- Bound to `HOST=0.0.0.0`, port 8000 for public access.
-- Notable EC2 runtime settings: `MCTS_DEBUG=1`, `MCTS_EARLY_STOP_MIN_VISITS=100000`.
+| var | default | meaning |
+| --- | --- | --- |
+| `SERVER` | `http://127.0.0.1:8000` | server URL |
+| `ENGINE_BIN` | `target/release/mcts-gomoku` | path to engine binary |
+| `MCTS_SECONDS` | 60 | passed through to the engine |
+| `POLL_SECS` | 0.5 | how often to poll for opponent's move |
 
-## 8) Debug log keys (when `MCTS_DEBUG=1`)
+## Architecture
 
-Visible in `ai.log`:
-- `root_expanded`, `root_unexpanded`
-- `tactical_depth`, `tactical_topk`, `tactical_chosen`
-- `mcts_chosen`, `total_root_visits`
+The server is a pure game state manager — it has no knowledge of the engine. The ai_client joins the matchmaking queue as a player (identical to a browser tab), calls the engine subprocess on its turn, and submits moves via `/play`. Two ai_client instances will play each other.
 
-## 9) Current architecture
+## Network architecture
 
-- Engine: Rust binary `target/release/mcts-gomoku`
-- Server: Python HTTP service (`web/server.py`)
-- AI bridge: Python polling client (`web/ai_client.py`)
-- Frontend: single HTML app (`web/index.html`)
-- Deployment: single EC2 instance running all components
-- Local directory renamed: `mcts` → `mcts-gomoku`
+Parallel MCTS with shared tree across threads using a single arena. Virtual loss reduces thread collisions. Tactical alpha-beta pre-search at root can override MCTS choice.
 
-## 10) Important behavior notes
+- `MCTS_LOCAL_RADIUS=2` is the main strength limiter — moves more than 2 cells from any stone are invisible to the engine
+- Tactical search is shallow (depth 2) and root-level only
+- `MCTS_ITERS` acts per-thread, not as a global cap
 
-- This is **free Gomoku** (no swap rules, no forbidden moves). Black has a theoretical forced win from center — not used in competitive tournament play (which uses Swap2).
-- `MCTS_LOCAL_RADIUS=2` is the main strength limiter — moves >2 cells from any stone are invisible to the engine.
-- Tactical alpha-beta is shallow (depth 2) and root-level only.
-- `MCTS_ITERS` acts per-thread, not as a strict global iteration cap.
-- Early stop controls compute efficiency, not correctness.
+## THREADS and the thermal/power issue
 
-## 11) Recent commits
+Uses `available_parallelism()` for worker thread count — no manual tuning needed.
 
-- `b408628` — extract make_node, zero_candidate, resolve_mv
-- `760dac6` — extract opp(), unify bounds check in wins_at
-- `c9f7e54` — use idx() in parse_move; use make_node in tests
-- `604f07e` — use idx() in transform_index
-- `347a2d5` — deduplicate test_cfg calls in worker tests
-- `8045e55` — add restart button tile to frontend; add CLAUDE.md
-- `edde4dd` — add /restart endpoint and wire up restart button
-- `947d37d` — track lastMouse to recompute hover on state change
+## Code style
+
+- No comments in production code
+- Zero external dependencies
+- cargo fmt for formatting

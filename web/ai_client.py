@@ -8,7 +8,7 @@ from pathlib import Path
 
 SERVER = os.environ.get("SERVER", "http://127.0.0.1:8000")
 ENGINE_BIN = os.environ.get("ENGINE_BIN", str(Path(__file__).resolve().parent.parent / "target/release/mcts-gomoku"))
-ENGINE_SECONDS = int(os.environ.get("ENGINE_SECONDS", "60"))
+MCTS_SECONDS = os.environ.get("MCTS_SECONDS", "60")
 POLL = float(os.environ.get("POLL_SECS", "0.5"))
 
 
@@ -30,33 +30,21 @@ def get(path: str):
 
 
 def parse_best_move(stdout: str):
-    best = None
-    for line in stdout.splitlines():
-        line = line.strip()
-        if "," in line and not line.startswith("best="):
-            parts = line.split(",")
-            if len(parts) == 2:
-                try:
-                    best = (int(parts[0]), int(parts[1]))
-                    continue
-                except ValueError:
-                    pass
-        if line.startswith("best="):
-            left = line.split(",", 1)[0]
-            parts = left.replace("best=", "").split()
-            if len(parts) == 2:
-                try:
-                    best = (int(parts[0]), int(parts[1]))
-                except ValueError:
-                    pass
-    return best
+    for line in reversed(stdout.splitlines()):
+        parts = line.strip().split(",")
+        if len(parts) == 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                pass
+    return None
 
 
 def think(moves: list[list[int]]):
     args = [f"{x},{y}" for x, y in moves]
     env = os.environ.copy()
-    env["MCTS_SECONDS"] = str(ENGINE_SECONDS)
-    p = subprocess.run([ENGINE_BIN, *args], text=True, capture_output=True, env=env, timeout=max(ENGINE_SECONDS + 10, 15))
+    env["MCTS_SECONDS"] = MCTS_SECONDS
+    p = subprocess.run([ENGINE_BIN, *args], text=True, capture_output=True, env=env, timeout=max(int(MCTS_SECONDS) + 10, 15))
     if p.stdout:
         print(p.stdout, end="")
     if p.stderr:
