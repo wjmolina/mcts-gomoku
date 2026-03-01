@@ -1,5 +1,5 @@
-use std::env;
 use std::collections::HashMap;
+use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +17,6 @@ struct Board {
     side: u8,
     moves_played: usize,
     last: Option<usize>,
-    hash: u64,
 }
 
 impl Board {
@@ -27,7 +26,6 @@ impl Board {
             side: BLACK,
             moves_played: 0,
             last: None,
-            hash: 0,
         }
     }
 
@@ -43,11 +41,13 @@ impl Board {
 
     fn play(&mut self, mv: usize) {
         self.cells[mv] = self.side;
-        self.hash ^= piece_hash(mv, self.side);
-        self.hash ^= SIDE_HASH;
         self.moves_played += 1;
         self.last = Some(mv);
         self.side = if self.side == BLACK { WHITE } else { BLACK };
+    }
+
+    fn tt_key(&self) -> u64 {
+        canonical_hash(&self.cells, self.side)
     }
 
     fn winner(&self) -> Option<u8> {
@@ -137,7 +137,10 @@ impl TtSharded {
     }
 
     fn insert(&self, hash: u64, idx: usize) {
-        self.shards[Self::shard_idx(hash)].lock().unwrap().insert(hash, idx);
+        self.shards[Self::shard_idx(hash)]
+            .lock()
+            .unwrap()
+            .insert(hash, idx);
     }
 }
 
@@ -150,6 +153,41 @@ fn splitmix64(mut x: u64) -> u64 {
 
 fn piece_hash(cell: usize, player: u8) -> u64 {
     splitmix64(((cell as u64) << 2) ^ (player as u64) ^ 0xA5A5_5A5A_DEAD_BEEF)
+}
+
+fn transform_index(sym: usize, cell: usize) -> usize {
+    let x = cell % N;
+    let y = cell / N;
+    let (tx, ty) = match sym {
+        0 => (x, y),
+        1 => (N - 1 - y, x),
+        2 => (N - 1 - x, N - 1 - y),
+        3 => (y, N - 1 - x),
+        4 => (N - 1 - x, y),
+        5 => (x, N - 1 - y),
+        6 => (y, x),
+        7 => (N - 1 - y, N - 1 - x),
+        _ => unreachable!(),
+    };
+    ty * N + tx
+}
+
+fn canonical_hash(cells: &[u8; CELLS], side: u8) -> u64 {
+    let mut hs = [0u64; 8];
+    for (cell, p) in cells.iter().copied().enumerate() {
+        if p == 0 {
+            continue;
+        }
+        for (s, h) in hs.iter_mut().enumerate() {
+            *h ^= piece_hash(transform_index(s, cell), p);
+        }
+    }
+    if side == WHITE {
+        for h in &mut hs {
+            *h ^= SIDE_HASH;
+        }
+    }
+    hs.into_iter().min().unwrap()
 }
 
 struct Rng(u64);
@@ -261,7 +299,8 @@ fn worker(
     tt: Tt,
     max_iters: Option<u64>,
 ) {
-    let seed = Instant::now().elapsed().as_nanos() as u64 ^ ((id as u64) << 32) ^ 0x9E3779B97F4A7C15;
+    let seed =
+        Instant::now().elapsed().as_nanos() as u64 ^ ((id as u64) << 32) ^ 0x9E3779B97F4A7C15;
     let mut rng = Rng::new(seed);
     let mut iters = 0u64;
 
@@ -298,7 +337,7 @@ fn worker(
             if let Some(mv) = maybe_expand {
                 board.play(mv);
                 let child_terminal = board.terminal();
-                let child_hash = board.hash;
+                let child_hash = board.tt_key();
                 let child_idx = tt.get_or_insert_with(child_hash, || {
                     let child = Node {
                         visits: AtomicU64::new(0),
@@ -400,9 +439,11 @@ fn run(args: &[String]) -> i32 {
     };
 
     let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-    let tt: Tt = tt_with_root(board.hash, 0usize);
+    let tt: Tt = tt_with_root(board.tt_key(), 0usize);
     let root_player = board.side;
-    let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let stop = Arc::new(AtomicBool::new(false));
 
     let seconds = env::var("MCTS_SECONDS")
@@ -594,6 +635,48 @@ mod tests {
     }
 
     #[test]
+    fn transform_index_is_a_permutation_for_each_symmetry() {
+        for sym in 0..8 {
+            let mut seen = vec![false; CELLS];
+            for cell in 0..CELLS {
+                let t = transform_index(sym, cell);
+                assert!(t < CELLS);
+                seen[t] = true;
+            }
+            assert!(seen.into_iter().all(|v| v));
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn transform_index_panics_on_invalid_symmetry() {
+        let _ = transform_index(8, 0);
+    }
+
+    #[test]
+    fn canonical_hash_matches_across_symmetric_positions() {
+        let mut b1 = Board::new();
+        b1.play(idx(2, 3));
+        b1.play(idx(4, 7));
+        b1.play(idx(10, 5));
+        b1.play(idx(1, 14));
+
+        let mut b2 = Board::new();
+        for cell in 0..CELLS {
+            let p = b1.cells[cell];
+            if p == 0 {
+                continue;
+            }
+            b2.cells[transform_index(1, cell)] = p;
+        }
+        b2.side = b1.side;
+        b2.moves_played = b1.moves_played;
+        b2.last = b1.last.map(|c| transform_index(1, c));
+
+        assert_eq!(b1.tt_key(), b2.tt_key());
+    }
+
+    #[test]
     fn rng_and_uct_behavior() {
         let mut rng = Rng::new(123);
         let a = rng.next_u64();
@@ -670,7 +753,11 @@ mod tests {
             untried: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         };
-        let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root), Arc::new(child_a), Arc::new(child_b)]));
+        let arena: Arena = Arc::new(Mutex::new(vec![
+            Arc::new(root),
+            Arc::new(child_a),
+            Arc::new(child_b),
+        ]));
         let (best_mv, best_visits, best_wr, node_count, _total_visits) = best_root_child(&arena);
         assert_eq!(best_mv, Some(idx(1, 1)));
         assert_eq!(best_visits, 4);
@@ -690,9 +777,17 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(true));
-        worker(0, board.clone(), board.side, stop, arena.clone(), tt, Some(100));
+        worker(
+            0,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            Some(100),
+        );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
     }
@@ -709,9 +804,17 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(0, board.clone(), board.side, stop, arena.clone(), tt, Some(0));
+        worker(
+            0,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            Some(0),
+        );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
     }
@@ -728,9 +831,17 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(1, board.clone(), board.side, stop, arena.clone(), tt, Some(2));
+        worker(
+            1,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            Some(2),
+        );
         let root_node = node_at(&arena, 0);
         assert!(root_node.visits.load(Ordering::Relaxed) >= 2);
         assert!(arena.lock().unwrap().len() > 1);
@@ -748,7 +859,7 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(2, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
         let root_node = node_at(&arena, 0);
@@ -765,11 +876,6 @@ mod tests {
         board.side = BLACK;
         board.moves_played = 4;
         board.last = Some(idx(3, 0));
-        board.hash = 0;
-        for x in 0..4 {
-            board.hash ^= piece_hash(idx(x, 0), BLACK);
-        }
-
         let root = Node {
             visits: AtomicU64::new(0),
             win_halves: AtomicU64::new(0),
@@ -779,7 +885,7 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(3, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
         assert!(arena.lock().unwrap().len() >= 2);
@@ -805,10 +911,10 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root), Arc::new(child)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let mut b2 = board.clone();
         b2.play(idx(0, 0));
-        tt.insert(b2.hash, 1usize);
+        tt.insert(b2.tt_key(), 1usize);
         let stop = Arc::new(AtomicBool::new(false));
         worker(4, board.clone(), BLACK, stop, arena.clone(), tt, Some(1));
 
@@ -831,9 +937,17 @@ mod tests {
             children: Mutex::new(Vec::new()),
         };
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(5, board.clone(), board.side, stop, arena.clone(), tt, Some(1));
+        worker(
+            5,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            Some(1),
+        );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 1);
     }
@@ -862,11 +976,19 @@ mod tests {
         };
 
         let arena: Arena = Arc::new(Mutex::new(vec![Arc::new(root), Arc::new(child)]));
-        let tt: Tt = tt_with_root(board.hash, 0usize);
-        tt.insert(child_board.hash, 1usize);
+        let tt: Tt = tt_with_root(board.tt_key(), 0usize);
+        tt.insert(child_board.tt_key(), 1usize);
 
         let stop = Arc::new(AtomicBool::new(false));
-        worker(6, board.clone(), board.side, stop, arena.clone(), tt, Some(1));
+        worker(
+            6,
+            board.clone(),
+            board.side,
+            stop,
+            arena.clone(),
+            tt,
+            Some(1),
+        );
 
         let root_node = node_at(&arena, 0);
         let kids = root_node.children.lock().unwrap().clone();
