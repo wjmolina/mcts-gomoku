@@ -433,25 +433,66 @@ fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
     false
 }
 
-fn rollout(mut board: Board, rng: &mut Rng, local_radius: usize) -> u8 {
-    let mut outcome = board.terminal();
-    while outcome.is_none() {
-        let legal = board.local_moves(local_radius);
-        let opp = if board.side == BLACK { WHITE } else { BLACK };
-        // 1. Win immediately if possible.
-        // 2. Block opponent's immediate win.
-        // 3. Fall back to random local move.
-        let mv = legal
-            .iter()
-            .find(|&&m| wins_at(&board.cells, board.side, m as usize))
-            .or_else(|| legal.iter().find(|&&m| wins_at(&board.cells, opp, m as usize)))
-            .copied()
-            .map(|m| m as usize)
-            .unwrap_or_else(|| legal[rng.gen_usize(legal.len())] as usize);
-        board.play(mv);
-        outcome = board.terminal();
+/// Heuristic threat score for `player`. Counts open and half-open runs of length 2–4.
+/// Higher score = more threatening position for that player.
+fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
+    let mut score = 0i32;
+    for &(dx, dy) in &DIRS {
+        for sy in 0..N as isize {
+            for sx in 0..N as isize {
+                let px = sx - dx;
+                let py = sy - dy;
+                // Only start counting from the leftmost cell of a run.
+                if Board::on_board(px, py)
+                    && cells[(py * N as isize + px) as usize] == player
+                {
+                    continue;
+                }
+                let mut len = 0usize;
+                let mut cx = sx;
+                let mut cy = sy;
+                while Board::on_board(cx, cy)
+                    && cells[(cy * N as isize + cx) as usize] == player
+                {
+                    len += 1;
+                    cx += dx;
+                    cy += dy;
+                }
+                if len == 0 || len >= 5 {
+                    continue;
+                }
+                let left_open = Board::on_board(px, py)
+                    && cells[(py * N as isize + px) as usize] == 0;
+                let right_open = Board::on_board(cx, cy)
+                    && cells[(cy * N as isize + cx) as usize] == 0;
+                let ends = left_open as usize + right_open as usize;
+                score += match (len, ends) {
+                    (4, 2) => 10_000,
+                    (4, 1) => 1_000,
+                    (3, 2) => 100,
+                    (3, 1) => 10,
+                    (2, 2) => 2,
+                    (2, 1) => 1,
+                    _ => 0,
+                };
+            }
+        }
     }
-    outcome.unwrap()
+    score
+}
+
+/// Static board evaluation: returns the player favoured by position, or 0 for equal.
+/// Replaces random rollouts with a fast pattern-based assessment.
+fn evaluate(cells: &[u8; CELLS]) -> u8 {
+    let bs = threat_score(cells, BLACK);
+    let ws = threat_score(cells, WHITE);
+    if bs > ws {
+        BLACK
+    } else if ws > bs {
+        WHITE
+    } else {
+        0
+    }
 }
 
 fn analyze_root(arena: &Arena) -> RootAnalysis {
@@ -746,12 +787,12 @@ fn worker(
                 if let Some(t) = child_terminal {
                     break t;
                 }
-                break rollout(board, &mut rng, cfg.local_radius);
+                break evaluate(&board.cells);
             }
 
             let kids = node.children.lock().unwrap().clone();
             if kids.is_empty() {
-                break rollout(board, &mut rng, cfg.local_radius);
+                break evaluate(&board.cells);
             }
 
             let parent_visits = node.visits.load(Ordering::Relaxed).max(1);
@@ -1304,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_helpers_and_rollout_terminal() {
+    fn arena_helpers_and_evaluate() {
         let root = Node {
             visits: AtomicU64::new(0),
             win_halves: AtomicU64::new(0),
@@ -1328,15 +1369,59 @@ mod tests {
         assert_eq!(child_idx, 1);
         let _n = node_at(&arena, 1);
 
-        let mut b = Board::new();
-        b.cells[idx(0, 0)] = BLACK;
-        b.cells[idx(1, 0)] = BLACK;
-        b.cells[idx(2, 0)] = BLACK;
-        b.cells[idx(3, 0)] = BLACK;
-        b.cells[idx(4, 0)] = BLACK;
-        b.last = Some(idx(2, 0));
-        let mut rng = Rng::new(1);
-        assert_eq!(rollout(b, &mut rng, 2), BLACK);
+        // evaluate: empty board → draw
+        assert_eq!(evaluate(&[0u8; CELLS]), 0);
+        // evaluate: BLACK open four → BLACK wins
+        let mut cells = [0u8; CELLS];
+        for x in 1..5 {
+            cells[idx(x, 0)] = BLACK;
+        }
+        assert_eq!(evaluate(&cells), BLACK);
+    }
+
+    #[test]
+    fn threat_score_and_evaluate_patterns() {
+        // Covers all match arms in threat_score and both non-draw branches of evaluate.
+        let mut c = [0u8; CELLS];
+
+        // (4, 2) open four: x=1..4, y=0; left=empty, right=empty
+        for x in 1..5 { c[idx(x, 0)] = BLACK; }
+        // (4, 1) wall-left four: x=0..3, y=1; left=wall, right=empty
+        for x in 0..4 { c[idx(x, 1)] = BLACK; }
+        // (4, 0) blocked four → `_`: x=0..3, y=2; left=wall, right=WHITE
+        for x in 0..4 { c[idx(x, 2)] = BLACK; }
+        c[idx(4, 2)] = WHITE;
+        // (4, 1) right-wall four: x=11..14, y=0; right_open off-board=false
+        for x in 11..15 { c[idx(x, 0)] = BLACK; }
+        // (3, 2) open three: x=1..3, y=3
+        for x in 1..4 { c[idx(x, 3)] = BLACK; }
+        // (3, 1) wall-left three: x=0..2, y=4
+        for x in 0..3 { c[idx(x, 4)] = BLACK; }
+        // (3, 0) blocked three → `_`: x=0..2, y=5; right=WHITE
+        for x in 0..3 { c[idx(x, 5)] = BLACK; }
+        c[idx(3, 5)] = WHITE;
+        // (2, 2) open two: x=1..2, y=6
+        for x in 1..3 { c[idx(x, 6)] = BLACK; }
+        // (2, 1) wall-left two: x=0..1, y=7
+        for x in 0..2 { c[idx(x, 7)] = BLACK; }
+        // (2, 0) blocked two → `_`: x=0..1, y=8; right=WHITE
+        for x in 0..2 { c[idx(x, 8)] = BLACK; }
+        c[idx(2, 8)] = WHITE;
+        // len=1 → `_`: isolated stone at corner
+        c[idx(14, 14)] = BLACK;
+        // len>=5 → skip: five in a row at y=9
+        for x in 0..5 { c[idx(x, 9)] = BLACK; }
+
+        let bs = threat_score(&c, BLACK);
+        assert!(bs > 0, "BLACK has many threats, score={bs}");
+        assert_eq!(threat_score(&[0u8; CELLS], BLACK), 0);
+
+        // evaluate: BLACK wins
+        assert_eq!(evaluate(&c), BLACK);
+        // evaluate: WHITE wins
+        let mut c2 = [0u8; CELLS];
+        for x in 1..5 { c2[idx(x, 0)] = WHITE; }
+        assert_eq!(evaluate(&c2), WHITE);
     }
 
     #[test]
