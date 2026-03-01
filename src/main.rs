@@ -1480,18 +1480,11 @@ mod tests {
     #[test]
     fn worker_stops_immediately_when_flag_set() {
         let board = Board::new();
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(100), 2)))]));
+        let cfg = test_cfg(Some(100), 2);
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, cfg))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(true));
-        worker(
-            0,
-            board.clone(),
-            board.side,
-            stop,
-            arena.clone(),
-            tt,
-            test_cfg(Some(100), 2),
-        );
+        worker(0, board.clone(), board.side, stop, arena.clone(), tt, cfg);
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
     }
@@ -1499,18 +1492,11 @@ mod tests {
     #[test]
     fn worker_respects_zero_iteration_limit() {
         let board = Board::new();
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(0), 2)))]));
+        let cfg = test_cfg(Some(0), 2);
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, cfg))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(
-            0,
-            board.clone(),
-            board.side,
-            stop,
-            arena.clone(),
-            tt,
-            test_cfg(Some(0), 2),
-        );
+        worker(0, board.clone(), board.side, stop, arena.clone(), tt, cfg);
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 0);
     }
@@ -1518,18 +1504,11 @@ mod tests {
     #[test]
     fn worker_runs_with_iteration_limit() {
         let board = Board::new();
-        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, test_cfg(Some(2), 2)))]));
+        let cfg = test_cfg(Some(2), 2);
+        let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(make_root_node(&board, cfg))]));
         let tt: Tt = tt_with_root(board.tt_key(), 0usize);
         let stop = Arc::new(AtomicBool::new(false));
-        worker(
-            1,
-            board.clone(),
-            board.side,
-            stop,
-            arena.clone(),
-            tt,
-            test_cfg(Some(2), 2),
-        );
+        worker(1, board.clone(), board.side, stop, arena.clone(), tt, cfg);
         let root_node = node_at(&arena, 0);
         assert!(root_node.visits.load(Ordering::Relaxed) >= 2);
         assert!(arena.read().unwrap().len() > 1);
