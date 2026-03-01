@@ -64,7 +64,7 @@ Multiple rounds of DRY audit across 5 commits (`b408628` → `347a2d5`):
 - Coverage: **100% regions / 100% functions / 100% lines** (verified via `cargo llvm-cov`).
 - Tests cover: board rules, win detection, parsing, worker branches, rollout/selection/backprop, tactical selection, run loop stop conditions, env parsing, transposition/symmetry hashing, root candidate merge.
 
-## 5) Backend/Service (`server.py`, `ai.py`)
+## 5) Backend/Service (`web/server.py`, `web/ai_client.py`)
 
 ### Server
 - Minimal HTTP server for game lifecycle and stateful play.
@@ -75,7 +75,7 @@ Multiple rounds of DRY audit across 5 commits (`b408628` → `347a2d5`):
 - Serves `web/index.html`.
 
 ### AI client bridge
-- `ai.py` polls server and plays as one queued participant.
+- `web/ai_client.py` polls server and plays as one queued participant.
 - Invokes engine binary each AI turn with move history args.
 - Uses environment-configured think time (`ENGINE_SECONDS`, default 60).
 - Parses both legacy `best=...` lines and new minimal `x,y` output.
@@ -110,8 +110,8 @@ Visible in `ai.log`:
 ## 9) Current architecture
 
 - Engine: Rust binary `target/release/mcts-gomoku`
-- Server: Python HTTP service (`server.py`)
-- AI bridge: Python polling client (`ai.py`)
+- Server: Python HTTP service (`web/server.py`)
+- AI bridge: Python polling client (`web/ai_client.py`)
 - Frontend: single HTML app (`web/index.html`)
 - Deployment: single EC2 instance running all components
 - Local directory renamed: `mcts` → `mcts-gomoku`

@@ -10,8 +10,8 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-ROOT = Path(__file__).resolve().parent
-WEB_DIR = ROOT / "web"
+WEB_DIR = Path(__file__).resolve().parent
+ROOT = WEB_DIR.parent
 INDEX_PATH = WEB_DIR / "index.html"
 
 HOST = os.environ.get("HOST", "127.0.0.1")

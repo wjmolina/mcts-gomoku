@@ -4,9 +4,10 @@ import os
 import subprocess
 import time
 import urllib.request
+from pathlib import Path
 
 SERVER = os.environ.get("SERVER", "http://127.0.0.1:8000")
-ENGINE_BIN = os.environ.get("ENGINE_BIN", os.path.join(os.path.dirname(__file__), "target/release/mcts-gomoku"))
+ENGINE_BIN = os.environ.get("ENGINE_BIN", str(Path(__file__).resolve().parent.parent / "target/release/mcts-gomoku"))
 ENGINE_SECONDS = int(os.environ.get("ENGINE_SECONDS", "60"))
 POLL = float(os.environ.get("POLL_SECS", "0.5"))
 
