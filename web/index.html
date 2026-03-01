@@ -7,11 +7,44 @@
 <style>
   html, body { margin: 0; height: 100%; }
   body { display: grid; place-items: center; background: #d9c7aa; overflow: hidden; }
+  #ui { position: relative; display: grid; place-items: center; }
+  #restart {
+    width: 3vmin;
+    height: 3vmin;
+    display: block;
+    cursor: default;
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform: translate(calc(-100% - 1vmin), 0);
+    transition: transform 90ms linear;
+  }
+  #restart.hot {
+    cursor: pointer;
+  }
+  #restart.hot.down {}
+  #restart_icon {
+    width: 3vmin;
+    height: 3vmin;
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform: translate(calc(-100% - 1vmin), 0);
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+    font-size: 2.8vmin;
+    line-height: 1;
+  }
   canvas { display: block; width: min(90vw, 90vh); height: min(90vw, 90vh); }
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<div id="ui">
+  <canvas id="restart" aria-label="Restart"></canvas>
+  <span id="restart_icon" aria-hidden="true">🔍</span>
+  <canvas id="c"></canvas>
+</div>
 <script>
 const N = 15, E = 0;
 const BOARD_BG = '#cda66f', GRID = 'rgba(63,43,24,0.82)';
@@ -19,12 +52,16 @@ const BLACK = '#22262e', WHITE = '#ebe5da';
 
 const c = document.getElementById('c');
 const g = c.getContext('2d');
+const restart = document.getElementById('restart');
+const rg = restart.getContext('2d');
+const restartIcon = document.getElementById('restart_icon');
 
 let state = null;
 let playerId = localStorage.getItem('player_id') || null;
 let thinking = false;
 let hover = null;
 let size = 0, step = 0, lineW = 0, stoneR = 0, start = 0;
+let restartHot = false, restartDown = false;
 let pollTimer = null;
 
 const idx = (x, y) => y * N + x;
@@ -49,7 +86,55 @@ function layout() {
   step = (size * 0.94) / (N - 1);
   stoneR = step * 0.425;
   start = stoneR + lineW / 2;
-  c.style.borderRadius = `${stoneR}px`;
+  c.style.borderRadius = `${(stoneR / size) * 100}%`;
+  const mini = step + 2 * start;
+  const miniPct = (mini / size) * 100;
+  restart.style.width = `${miniPct}%`;
+  restart.style.height = `${miniPct}%`;
+  restart.style.borderRadius = `${(stoneR / mini) * 100}%`;
+  restartIcon.style.width = `${miniPct}%`;
+  restartIcon.style.height = `${miniPct}%`;
+  const rSize = Math.max(1, restart.getBoundingClientRect().width);
+  restart.width = Math.round(rSize * dpr);
+  restart.height = Math.round(rSize * dpr);
+  rg.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawRestartTile(rSize);
+}
+
+function drawRestartTile(s) {
+  rg.clearRect(0, 0, s, s);
+  rg.fillStyle = BOARD_BG;
+  rg.fillRect(0, 0, s, s);
+
+  const v = rg.createRadialGradient(s / 2, s / 2, s * 0.3, s / 2, s / 2, s * 0.7);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.08)');
+  rg.fillStyle = v;
+  rg.fillRect(0, 0, s, s);
+
+  const model = step + 2 * start;
+  const scale = s / model;
+  const pad = start * scale;
+  const cell = step * scale;
+  const lw = lineW * scale;
+  const h = lw / 2;
+  if (restartHot) {
+    rg.fillStyle = restartDown ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.16)';
+    rg.fillRect(pad, pad, cell, cell);
+  }
+  rg.strokeStyle = GRID;
+  rg.lineWidth = lw;
+  rg.beginPath();
+  rg.moveTo(pad, pad + h); rg.lineTo(pad + cell, pad + h);
+  rg.moveTo(pad, pad + cell - h); rg.lineTo(pad + cell, pad + cell - h);
+  rg.moveTo(pad + h, pad); rg.lineTo(pad + h, pad + cell);
+  rg.moveTo(pad + cell - h, pad); rg.lineTo(pad + cell - h, pad + cell);
+  rg.stroke();
+
+}
+
+function setRestartIcon() {
+  restartIcon.textContent = state && state.status === 'matched' ? '🏳️' : '🔍';
 }
 
 function drawStone(cx, cy, isBlack) {
@@ -100,6 +185,8 @@ function drawBoard() {
 }
 
 function draw() {
+  setRestartIcon();
+  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
   drawBoard();
   if (!state || state.status !== 'matched') {
     c.style.cursor = 'default';
@@ -168,6 +255,33 @@ async function connectAndJoin() {
   draw();
 }
 
+async function restartGame() {
+  if (thinking) return;
+  hover = null;
+  state = { status: 'waiting' };
+  playerId = null;
+  localStorage.removeItem('player_id');
+  draw();
+  await connectAndJoin();
+}
+
+function restartLocalPos(e) {
+  const r = restart.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function restartHit(e) {
+  const q = restartLocalPos(e);
+  const r = restart.getBoundingClientRect();
+  const nx = q.x / Math.max(1, r.width);
+  const ny = q.y / Math.max(1, r.height);
+  const model = step + 2 * start;
+  const padFrac = start / model;
+  const cellFrac = step / model;
+  return nx >= padFrac && nx <= padFrac + cellFrac
+    && ny >= padFrac && ny <= padFrac + cellFrac;
+}
+
 async function play(x, y) {
   thinking = true;
   hover = null;
@@ -207,6 +321,33 @@ c.addEventListener('mousemove', e => {
 });
 
 c.addEventListener('mouseleave', () => { if (hover) { hover = null; draw(); } });
+restart.addEventListener('mousemove', e => {
+  restartHot = restartHit(e);
+  restart.classList.toggle('hot', restartHot);
+  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+});
+restart.addEventListener('mouseleave', () => {
+  restartHot = false;
+  restartDown = false;
+  restart.classList.remove('hot', 'down');
+  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+});
+restart.addEventListener('mousedown', e => {
+  if (restartHit(e)) {
+    restartDown = true;
+    restart.classList.add('down');
+    drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+  }
+});
+restart.addEventListener('mouseup', () => {
+  restartDown = false;
+  restart.classList.remove('down');
+  drawRestartTile(Math.max(1, restart.getBoundingClientRect().width));
+});
+restart.addEventListener('click', async e => {
+  if (!restartHit(e)) return;
+  await restartGame();
+});
 window.addEventListener('resize', () => { layout(); draw(); });
 
 (async function init() {
