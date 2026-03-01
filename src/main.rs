@@ -859,6 +859,21 @@ fn run(args: &[String]) -> i32 {
         return 0;
     }
 
+    // Pre-search forced-move check: play an immediate win or block an immediate
+    // opponent win without spinning up workers or sleeping.
+    {
+        let legal = board.legal_moves();
+        let opp = if board.side == BLACK { WHITE } else { BLACK };
+        let forced = legal
+            .iter()
+            .find(|&&m| wins_at(&board.cells, board.side, m as usize))
+            .or_else(|| legal.iter().find(|&&m| wins_at(&board.cells, opp, m as usize)));
+        if let Some(&mv) = forced {
+            print_move_result(mv as usize);
+            return 0;
+        }
+    }
+
     let root = make_root_node(&board, cfg);
     let arena: Arena = Arc::new(RwLock::new(vec![Arc::new(root)]));
     let tt: Tt = tt_with_root(board.tt_key(), 0usize);
@@ -1741,6 +1756,35 @@ mod tests {
         env::remove_var(ENV_TACTICAL_DEPTH);
         env::remove_var(ENV_TACTICAL_TOPK);
         env::remove_var(ENV_DEBUG);
+    }
+
+    #[test]
+    fn run_presearch_instant_win_and_block() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var(ENV_SECONDS);
+        env::remove_var(ENV_ITERS);
+
+        // White has 4-in-a-row at y=0; it is white's turn (9 moves played).
+        // Black stones are scattered so no 5-in-a-row is formed.
+        // Covers the else{BLACK} opp branch and the forced Some branch.
+        let args = vec![
+            "0,14".to_string(), "0,0".to_string(),
+            "14,0".to_string(), "1,0".to_string(),
+            "0,13".to_string(), "2,0".to_string(),
+            "14,1".to_string(), "3,0".to_string(),
+            "0,12".to_string(),
+        ];
+        assert_eq!(run(&args), 0);
+
+        // Black has 4-in-a-row at y=1; it is black's turn (8 moves played).
+        // Covers wins_at for board.side finding the win immediately.
+        let args2 = vec![
+            "0,1".to_string(), "0,2".to_string(),
+            "1,1".to_string(), "1,2".to_string(),
+            "2,1".to_string(), "2,2".to_string(),
+            "3,1".to_string(), "3,2".to_string(),
+        ];
+        assert_eq!(run(&args2), 0);
     }
 
     #[test]
