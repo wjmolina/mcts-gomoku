@@ -615,15 +615,19 @@ fn apply_moves(board: &mut Board, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn make_root_node(board: &Board, cfg: EngineConfig) -> Node {
+fn make_node(terminal: Option<u8>, untried: Vec<Move>) -> Node {
     Node {
         visits: AtomicU64::new(0),
         win_halves: AtomicU64::new(0),
         virtual_loss: AtomicU64::new(0),
-        terminal: board.terminal(),
-        untried: Mutex::new(board.local_moves(cfg.local_radius)),
+        terminal,
+        untried: Mutex::new(untried),
         children: Mutex::new(Vec::new()),
     }
+}
+
+fn make_root_node(board: &Board, cfg: EngineConfig) -> Node {
+    make_node(board.terminal(), board.local_moves(cfg.local_radius))
 }
 
 fn spawn_workers(
@@ -669,16 +673,12 @@ fn print_move_result(mv: usize) {
     println!("{x},{y}");
 }
 
+fn zero_candidate(mv: usize) -> Candidate {
+    Candidate { mv, visits: 0, winrate: 0.0 }
+}
+
 fn candidate_for_mv(ranked: &[Candidate], mv: usize) -> Candidate {
-    ranked
-        .iter()
-        .find(|c| c.mv == mv)
-        .copied()
-        .unwrap_or(Candidate {
-            mv,
-            visits: 0,
-            winrate: 0.0,
-        })
+    ranked.iter().find(|c| c.mv == mv).copied().unwrap_or_else(|| zero_candidate(mv))
 }
 
 fn merged_root_candidates(board: &Board, ranked: &[Candidate]) -> Vec<Candidate> {
@@ -691,11 +691,7 @@ fn merged_root_candidates(board: &Board, ranked: &[Candidate]) -> Vec<Candidate>
     let mut out = Vec::<Candidate>::with_capacity(legal.len());
     for mv in legal {
         let m = mv as usize;
-        out.push(by_move.get(&m).copied().unwrap_or(Candidate {
-            mv: m,
-            visits: 0,
-            winrate: 0.0,
-        }));
+        out.push(by_move.get(&m).copied().unwrap_or_else(|| zero_candidate(m)));
     }
     out.sort_by(|a, b| b.visits.cmp(&a.visits));
     out
@@ -779,15 +775,7 @@ fn worker(
                 let child_terminal = board.terminal();
                 let child_hash = board.tt_key();
                 let child_idx = tt.get_or_insert_with(child_hash, || {
-                    let child = Node {
-                        visits: AtomicU64::new(0),
-                        win_halves: AtomicU64::new(0),
-                        virtual_loss: AtomicU64::new(0),
-                        terminal: child_terminal,
-                        untried: Mutex::new(board.local_moves(cfg.local_radius)),
-                        children: Mutex::new(Vec::new()),
-                    };
-                    add_child(&arena, child)
+                    add_child(&arena, make_node(child_terminal, board.local_moves(cfg.local_radius)))
                 });
                 {
                     let mut kids = node.children.lock().unwrap();
@@ -887,6 +875,10 @@ fn analyse_and_pick(board: &Board, arena: &Arena, cfg: EngineConfig) -> (Option<
     (mv, tactical.is_some(), analysis)
 }
 
+fn resolve_mv(chosen_mv: Option<usize>, board: &Board, cfg: EngineConfig) -> usize {
+    chosen_mv.unwrap_or_else(|| board.local_moves(cfg.local_radius)[0] as usize)
+}
+
 fn run(args: &[String]) -> i32 {
     let mut cfg = EngineConfig::from_env();
     // Guard: seconds=0 with no iteration cap has no termination condition → fall back to default.
@@ -953,7 +945,7 @@ fn run(args: &[String]) -> i32 {
             snap.total_visits,
         );
         if cfg.debug {
-            let dbg_mv = chosen_mv.unwrap_or_else(|| board.local_moves(cfg.local_radius)[0] as usize);
+            let dbg_mv = resolve_mv(chosen_mv, &board, cfg);
             print_search_choice(
                 candidate_for_mv(&analysis.ranked, dbg_mv),
                 start.elapsed().as_secs(),
@@ -988,7 +980,7 @@ fn run(args: &[String]) -> i32 {
     }
 
     let (chosen_mv, _, analysis) = analyse_and_pick(&board, &arena, cfg);
-    let mv = chosen_mv.unwrap_or_else(|| board.local_moves(cfg.local_radius)[0] as usize);
+    let mv = resolve_mv(chosen_mv, &board, cfg);
     if cfg.debug {
         print_search_choice(
             candidate_for_mv(&analysis.ranked, mv),
