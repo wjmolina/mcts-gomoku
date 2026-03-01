@@ -89,7 +89,7 @@ impl Board {
         self.cells[mv] = self.side;
         self.moves_played += 1;
         self.last = Some(mv);
-        self.side = if self.side == BLACK { WHITE } else { BLACK };
+        self.side = opp(self.side);
     }
 
     fn tt_key(&self) -> u64 {
@@ -374,6 +374,10 @@ fn move_to_xy(mv: usize) -> (usize, usize) {
     (mv % N, mv / N)
 }
 
+fn opp(player: u8) -> u8 {
+    if player == BLACK { WHITE } else { BLACK }
+}
+
 fn opening_move(board: &Board) -> Option<usize> {
     match board.moves_played {
         // Black always opens at center.
@@ -416,7 +420,7 @@ fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
             loop {
                 let nx = x + sign * dx * i;
                 let ny = y + sign * dy * i;
-                if nx < 0 || nx >= N as isize || ny < 0 || ny >= N as isize {
+                if !Board::on_board(nx, ny) {
                     break;
                 }
                 if cells[idx(nx as usize, ny as usize)] != player {
@@ -442,7 +446,7 @@ fn wins_at(cells: &[u8; CELLS], player: u8, pos: usize) -> bool {
 ///   four + three → +10 000  (four-three fork: very strong)
 ///   two threes  → +5 000    (double-three: usually unblockable)
 fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
-    let opp = if player == BLACK { WHITE } else { BLACK };
+    let opp = opp(player);
     let mut score = 0i32;
     let mut four_dirs = [false; 4];
     let mut three_dirs = [false; 4];
@@ -909,7 +913,7 @@ fn run(args: &[String]) -> i32 {
     // opponent win without spinning up workers or sleeping.
     {
         let legal = board.legal_moves();
-        let opp = if board.side == BLACK { WHITE } else { BLACK };
+        let opp = opp(board.side);
         let forced = legal
             .iter()
             .find(|&&m| wins_at(&board.cells, board.side, m as usize))
