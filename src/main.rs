@@ -11,8 +11,8 @@ const BLACK: u8 = 1;
 const WHITE: u8 = 2;
 const DIRS: [(isize, isize); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)];
 const UCT_C: f32 = std::f32::consts::SQRT_2;
-const BACKPROP_WIN: u64 = 2;
-const BACKPROP_DRAW: u64 = 1;
+const BACKPROP_WIN: u64 = 2000;
+const BACKPROP_DRAW: u64 = 1000;
 const BACKPROP_LOSS: u64 = 0;
 const PATH_CAPACITY: usize = 256;
 
@@ -354,7 +354,7 @@ fn uct(child_win_halves: u64, child_visits: u64, child_vl: u64, parent_visits: u
     if v == 0 {
         return f32::INFINITY;
     }
-    let q = (child_win_halves as f32) / (2.0 * v as f32);
+    let q = (child_win_halves as f32) / (BACKPROP_WIN as f32 * v as f32);
     let u = UCT_C * ((parent_visits.max(1) as f32).ln() / v as f32).sqrt();
     q + u
 }
@@ -475,7 +475,17 @@ fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
                 }
                 score += match p_count {
                     4 => 1_000,
-                    3 => 100,
+                    3 => {
+                        let open_before = Board::on_board(sx - dx, sy - dy)
+                            && cells[((sy - dy) * N as isize + (sx - dx)) as usize] != opp;
+                        let open_after = Board::on_board(sx + dx * 5, sy + dy * 5)
+                            && cells[((sy + dy * 5) * N as isize + (sx + dx * 5)) as usize] != opp;
+                        match (open_before as u8) + (open_after as u8) {
+                            2 => 300,
+                            1 => 100,
+                            _ => 30,
+                        }
+                    }
                     2 => 10,
                     1 => 1,
                     _ => 0,
@@ -496,16 +506,14 @@ fn threat_score(cells: &[u8; CELLS], player: u8) -> i32 {
 
 /// Static board evaluation: returns the player favoured by position, or 0 for equal.
 /// Replaces random rollouts with a fast pattern-based assessment.
-fn evaluate(cells: &[u8; CELLS]) -> u8 {
-    let bs = threat_score(cells, BLACK);
-    let ws = threat_score(cells, WHITE);
-    if bs > ws {
-        BLACK
-    } else if ws > bs {
-        WHITE
-    } else {
-        0
+fn evaluate(cells: &[u8; CELLS], player: u8) -> u64 {
+    let ps = threat_score(cells, player);
+    let os = threat_score(cells, opp(player));
+    let total = ps + os;
+    if total <= 0 {
+        return BACKPROP_DRAW;
     }
+    (ps as f64 / total as f64 * BACKPROP_WIN as f64) as u64
 }
 
 fn analyze_root(arena: &Arena) -> RootAnalysis {
@@ -526,7 +534,7 @@ fn analyze_root(arena: &Arena) -> RootAnalysis {
         let cand = Candidate {
             mv: mv_u16 as usize,
             visits,
-            winrate: win_halves as f64 / (2.0 * visits.max(1) as f64),
+            winrate: win_halves as f64 / (BACKPROP_WIN as f64 * visits.max(1) as f64),
         };
         if visits > best_visits {
             best_visits = visits;
@@ -556,8 +564,22 @@ fn alpha_beta(board: &Board, depth: usize, mut alpha: i8, beta: i8, radius: usiz
         return 0;
     }
 
+    let mut moves = board.local_moves(radius);
+    let side = board.side;
+    moves.sort_by_cached_key(|&mv| {
+        let m = mv as usize;
+        if wins_at(&board.cells, side, m) {
+            std::cmp::Reverse(i32::MAX)
+        } else if wins_at(&board.cells, opp(side), m) {
+            std::cmp::Reverse(i32::MAX - 1)
+        } else {
+            let mut b = board.clone();
+            b.play(m);
+            std::cmp::Reverse(threat_score(&b.cells, side) - threat_score(&b.cells, opp(side)))
+        }
+    });
     let mut best = -1i8;
-    for mv in board.local_moves(radius) {
+    for mv in moves {
         let mut b2 = board.clone();
         b2.play(mv as usize);
         let score = -alpha_beta(&b2, depth - 1, -beta, -alpha, radius);
@@ -753,11 +775,11 @@ fn worker(
         let mut node_idx = 0usize;
         path.push(0);
 
-        let outcome = loop {
+        let outcome: u64 = loop {
             let node = node_at(&arena, node_idx);
 
             if let Some(t) = node.terminal {
-                break t;
+                break if t == root_player { BACKPROP_WIN } else if t == 0 { BACKPROP_DRAW } else { BACKPROP_LOSS };
             }
 
             let maybe_expand = {
@@ -786,14 +808,14 @@ fn worker(
                 path.push(child_idx);
 
                 if let Some(t) = child_terminal {
-                    break t;
+                    break if t == root_player { BACKPROP_WIN } else if t == 0 { BACKPROP_DRAW } else { BACKPROP_LOSS };
                 }
-                break evaluate(&board.cells);
+                break evaluate(&board.cells, root_player);
             }
 
             let kids = node.children.lock().unwrap().clone();
             if kids.is_empty() {
-                break evaluate(&board.cells);
+                break evaluate(&board.cells, root_player);
             }
 
             let parent_visits = node.visits.load(Ordering::Relaxed).max(1);
@@ -831,23 +853,9 @@ fn worker(
             // opponent; etc.  Flip at every other level so UCT selection
             // correctly maximises each side's own win-rate.
             let reward = if depth > 0 && depth % 2 == 0 {
-                // Opponent chose this node — store from opponent's perspective.
-                if outcome != root_player && outcome != 0 {
-                    BACKPROP_WIN
-                } else if outcome == 0 {
-                    BACKPROP_DRAW
-                } else {
-                    BACKPROP_LOSS
-                }
+                BACKPROP_WIN - outcome
             } else {
-                // Root player's perspective (root itself, or node chosen by root_player).
-                if outcome == root_player {
-                    BACKPROP_WIN
-                } else if outcome == 0 {
-                    BACKPROP_DRAW
-                } else {
-                    BACKPROP_LOSS
-                }
+                outcome
             };
             n.visits.fetch_add(1, Ordering::Relaxed);
             n.win_halves.fetch_add(reward, Ordering::Relaxed);
@@ -954,6 +962,13 @@ fn run(args: &[String]) -> i32 {
             );
         }
 
+        if cfg
+            .max_iters
+            .map(|_| handles.iter().all(|h| h.is_finished()))
+            .unwrap_or(false)
+        {
+            break;
+        }
         if cfg.seconds > 0 && start.elapsed().as_secs() >= cfg.seconds {
             stop.store(true, Ordering::Relaxed);
             break;
@@ -964,13 +979,6 @@ fn run(args: &[String]) -> i32 {
             && (snap.best_visits as f64 / snap.total_visits as f64) >= cfg.early_stop_ratio
         {
             stop.store(true, Ordering::Relaxed);
-            break;
-        }
-        let workers_done = cfg
-            .max_iters
-            .map(|_| handles.iter().all(|h| h.is_finished()))
-            .unwrap_or(false);
-        if workers_done {
             break;
         }
     }
@@ -1225,6 +1233,15 @@ mod tests {
         b.moves_played = 4;
         b.last = Some(idx(3, 0));
         assert_eq!(alpha_beta(&b, 1, -1, 1, 2), 1);
+
+        let mut b2 = Board::new();
+        for x in 0..4 {
+            b2.cells[idx(x, 0)] = WHITE;
+        }
+        b2.side = BLACK;
+        b2.moves_played = 4;
+        b2.last = Some(idx(0, 0));
+        assert_eq!(alpha_beta(&b2, 1, -1, 1, 2), 0);
     }
 
     #[test]
@@ -1356,21 +1373,19 @@ mod tests {
         assert_eq!(child_idx, 1);
         let _n = node_at(&arena, 1);
 
-        // evaluate: empty board → draw
-        assert_eq!(evaluate(&[0u8; CELLS]), 0);
-        // evaluate: BLACK open four → BLACK wins
+        assert_eq!(evaluate(&[0u8; CELLS], BLACK), BACKPROP_DRAW);
         let mut cells = [0u8; CELLS];
         for x in 1..5 {
             cells[idx(x, 0)] = BLACK;
         }
-        assert_eq!(evaluate(&cells), BLACK);
+        assert!(evaluate(&cells, BLACK) > BACKPROP_DRAW);
     }
 
     #[test]
     fn threat_score_and_evaluate_patterns() {
         // Empty board: score 0 for both, evaluate returns draw (covers p_count=0 / `_` arm).
         assert_eq!(threat_score(&[0u8; CELLS], BLACK), 0);
-        assert_eq!(evaluate(&[0u8; CELLS]), 0);
+        assert_eq!(evaluate(&[0u8; CELLS], BLACK), BACKPROP_DRAW);
 
         // Single stone: several k=1 windows exist (covers p_count=1 arm).
         let mut c1 = [0u8; CELLS];
@@ -1400,11 +1415,10 @@ mod tests {
         let s_blocked = threat_score(&co, BLACK);
         assert!(s_blocked < s_open, "opponent blocks one window: {s_blocked} < {s_open}");
 
-        // evaluate: returns correct player.
-        assert_eq!(evaluate(&c4), BLACK);
+        assert!(evaluate(&c4, BLACK) > BACKPROP_DRAW);
         let mut cw = [0u8; CELLS];
         for x in 1..5 { cw[idx(x, 0)] = WHITE; }
-        assert_eq!(evaluate(&cw), WHITE);
+        assert!(evaluate(&cw, WHITE) > BACKPROP_DRAW);
     }
 
     #[test]
@@ -1454,7 +1468,7 @@ mod tests {
         let child_a = make_node(None, vec![]);
         let child_b = Node {
             visits: AtomicU64::new(4),
-            win_halves: AtomicU64::new(6),
+            win_halves: AtomicU64::new(6000),
             virtual_loss: AtomicU64::new(0),
             terminal: None,
             untried: Mutex::new(Vec::new()),
@@ -1531,7 +1545,7 @@ mod tests {
         );
         let root_node = node_at(&arena, 0);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 1);
-        assert_eq!(root_node.win_halves.load(Ordering::Relaxed), 2);
+        assert_eq!(root_node.win_halves.load(Ordering::Relaxed), BACKPROP_WIN);
     }
 
     #[test]
@@ -1596,7 +1610,7 @@ mod tests {
         let root_node = node_at(&arena, 0);
         let child_node = node_at(&arena, 1);
         assert_eq!(root_node.visits.load(Ordering::Relaxed), 6);
-        assert_eq!(root_node.win_halves.load(Ordering::Relaxed), 1);
+        assert_eq!(root_node.win_halves.load(Ordering::Relaxed), BACKPROP_DRAW);
         assert_eq!(child_node.virtual_loss.load(Ordering::Relaxed), 0);
     }
 
@@ -1713,12 +1727,13 @@ mod tests {
     #[test]
     fn run_executes_done_false_path_before_seconds_break() {
         let _g = ENV_LOCK.lock().unwrap();
-        env::set_var(ENV_SECONDS, "2");
-        env::set_var(ENV_ITERS, "1000000000");
+        env::set_var(ENV_SECONDS, "4");
+        env::remove_var(ENV_ITERS);
+        env::set_var(ENV_TACTICAL_TOPK, "0");
         let args = vec!["7,7".to_string(), "7,8".to_string()];
         assert_eq!(run(&args), 0);
         env::remove_var(ENV_SECONDS);
-        env::remove_var(ENV_ITERS);
+        env::remove_var(ENV_TACTICAL_TOPK);
     }
 
     #[test]
